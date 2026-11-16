@@ -7,18 +7,17 @@ Subject: [PATCH] dm/ios: add Cemuhook UDP (DSU Controller) input and 6-axis
 Upstream-Status: pending
 Reason: Add Cemuhook UDP (DSU Controller) input and motion support on port 26760
 Issue: LNPANDY/NX2Apple#1
-
 ---
  dm/host/Makefile           |   2 +-
- dm/host/dsu_proto.h        | 319 +++++++++++++++++++++++++++++++++++++
+ dm/host/dsu_proto.h        | 325 +++++++++++++++++++++++++++++++++++++
  dm/host/hle_lifecycle.c    |   2 +
  dm/host/pad_dsu_apple.h    |  38 +++++
  dm/host/pad_dsu_apple.m    | 318 ++++++++++++++++++++++++++++++++++++
  dm/host/tests/Makefile     |   5 +-
- dm/host/tests/t_dsu.c      | 106 ++++++++++++
+ dm/host/tests/t_dsu.c      | 105 ++++++++++++
  dm/ios/Sources/DmGamepad.m |  92 +++++++++--
  dm/ios/Sources/front_ios.m |   2 +
- 9 files changed, 872 insertions(+), 12 deletions(-)
+ 9 files changed, 877 insertions(+), 12 deletions(-)
  create mode 100644 dm/host/dsu_proto.h
  create mode 100644 dm/host/pad_dsu_apple.h
  create mode 100644 dm/host/pad_dsu_apple.m
@@ -39,10 +38,10 @@ index c059b6b..b3cf152 100644
  GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))
 diff --git a/dm/host/dsu_proto.h b/dm/host/dsu_proto.h
 new file mode 100644
-index 0000000..42d01c1
+index 0000000..4d79a15
 --- /dev/null
 +++ b/dm/host/dsu_proto.h
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,325 @@
 +// Cemuhook UDP (DSU Controller, protocol v1001, default port 26760) protocol parser, CRC32, and Switch coordinate mapping.
 +// Pure C, no platform headers, so tests/t_dsu.c checks it on any machine; pad_dsu_apple.m is the UDP socket transport shared by
 +// the Mac and iOS front ends (DmGamepad.m, controllers_mac.m).
@@ -298,7 +297,13 @@ index 0000000..42d01c1
 +}
 +
 +static inline int dsu_home(const dsu_report *r) {
-+    return r && r->connected && (r->home & 0x01) != 0;
++    return r && r->connected && ((r->home & 0x01) != 0 || (r->b1 & (DSU_B1_SHARE | DSU_B1_OPTIONS)) == (DSU_B1_SHARE | DSU_B1_OPTIONS));
++}
++
++static inline void dsu_ab(const dsu_report *r, int *a, int *b) {
++    if (!r || !r->connected) return;
++    if ((r->b2 & DSU_B2_EAST)  || r->analog_face[0] > 128) *a |= 1;
++    if ((r->b2 & DSU_B2_SOUTH) || r->analog_face[1] > 128) *b |= 1;
 +}
 +
 +// Default 6-channel signed map from DSU raw_motion[0..5] (1:acc_x, 2:acc_y, 3:acc_z, 4:pitch, 5:yaw, 6:roll)
@@ -782,10 +787,10 @@ index 7d010cc..d581d8a 100644
  # It measures, it does not test: make -i runs every test even after one fails (the plain run reports that), so the coverage of the others is kept.
 diff --git a/dm/host/tests/t_dsu.c b/dm/host/tests/t_dsu.c
 new file mode 100644
-index 0000000..c387a5c
+index 0000000..8fda30d
 --- /dev/null
 +++ b/dm/host/tests/t_dsu.c
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,105 @@
 +// Cemuhook UDP (DSU Controller, dsu_proto.h) protocol framing, CRC32, button/stick decoding, and 6-axis motion conversion tests.
 +#include <stdio.h>
 +#include <stdlib.h>
@@ -797,29 +802,28 @@ index 0000000..c387a5c
 +int main(void) {
 +    // 1. IEEE 802.3 CRC32 standard vector ("123456789" -> 0xCBF43926)
 +    const uint8_t vec[] = "123456789";
-+    CHECK(dsu_crc32(vec, 9) == 0xCBF43926u);
++    CHECK(dsu_crc32(vec, 9, 0) == 0xCBF43926u);
 +
 +    // 2. Client subscription request packet (0x100002) and controller info request (0x100001)
 +    uint8_t req[32];
 +    size_t n = dsu_make_data_req(req, 0x11223344u, 1, 2);
-+    CHECK(n == 28);
-+    CHECK(memcmp(req, "DSUC", 4) == 0 && dsu_u16(req + 4) == DSU_VERSION && dsu_u16(req + 6) == 12);
-+    CHECK(dsu_u32(req + 12) == 0x11223344u && dsu_u32(req + 16) == DSU_TYPE_DATA && req[20] == 1 && req[21] == 2);
++    CHECK(n == 32);
++    CHECK(memcmp(req, "DSUC", 4) == 0 && dsu_u16(req + 4) == DSU_PROTOCOL_VERSION && dsu_u16(req + 6) == 16);
++    CHECK(dsu_u32(req + 12) == 0x11223344u && dsu_u32(req + 16) == DSU_MSG_DATA && req[20] == 1 && req[21] == 2);
 +    uint32_t pkt_crc = dsu_u32(req + 8);
-+    dsu_put_u32(req + 8, 0);
-+    CHECK(dsu_crc32(req, n) == pkt_crc);
++    CHECK(dsu_crc32(req, n, 1) == pkt_crc);
 +
 +    size_t pn = dsu_make_ports_req(req, 0xAABBCCDDu);
-+    CHECK(pn == 28 && dsu_u32(req + 16) == DSU_TYPE_PORTS && dsu_u32(req + 20) == 4);
++    CHECK(pn == 28 && dsu_u32(req + 16) == DSU_MSG_PORTS && dsu_u32(req + 20) == 4);
 +
 +    // 3. Server 0x100002 controller data packet parsing, buttons, sticks, and 6-axis motion
 +    uint8_t pkt[100];
 +    memset(pkt, 0, sizeof pkt);
 +    memcpy(pkt, "DSUS", 4);
-+    dsu_put_u16(pkt + 4, DSU_VERSION);
++    dsu_put_u16(pkt + 4, DSU_PROTOCOL_VERSION);
 +    dsu_put_u16(pkt + 6, 84); // 100 - 16
 +    dsu_put_u32(pkt + 12, 0xCAFEBABEu);
-+    dsu_put_u32(pkt + 16, DSU_TYPE_DATA);
++    dsu_put_u32(pkt + 16, DSU_MSG_DATA);
 +
 +    pkt[20] = 0; // slot 0
 +    pkt[21] = 2; // connected
@@ -836,22 +840,22 @@ index 0000000..c387a5c
 +    pkt[42] = 128;  // RX center (0)
 +    pkt[43] = 255;  // RY full up (+32767)
 +
-+    // Motion timestamp: 1,500,000 us
-+    dsu_put_u32(pkt + 56, 1500000u);
-+    dsu_put_u32(pkt + 60, 0u);
++    // Motion timestamp: 1,500,000 us (offset 68)
++    dsu_put_u32(pkt + 68, 1500000u);
++    dsu_put_u32(pkt + 72, 0u);
 +    // DSU accel: ax = 0, ay = -1.0 G (flat on table), az = 0
 +    // DSU gyro: pitch = +90 deg/s, yaw = -180 deg/s, roll = +45 deg/s
 +    float motion[6] = {0.0f, -1.0f, 0.0f, 90.0f, -180.0f, 45.0f};
 +    for (int i = 0; i < 6; i++) {
 +        uint32_t bits;
 +        memcpy(&bits, &motion[i], 4);
-+        dsu_put_u32(pkt + 64 + i * 4, bits);
++        dsu_put_u32(pkt + 76 + i * 4, bits);
 +    }
-+    dsu_put_u32(pkt + 8, dsu_crc32(pkt, sizeof pkt));
++    dsu_put_u32(pkt + 8, dsu_crc32(pkt, sizeof pkt, 1));
 +
 +    dsu_report r;
 +    CHECK(dsu_report_parse(pkt, sizeof pkt, &r));
-+    CHECK(r.slot == 0 && r.connected == 1 && r.motion_ok == 1 && r.packet_num == 42);
++    CHECK(r.slot == 0 && r.connected == 1 && r.model == DSU_MODEL_FULL_GYRO && r.packet_num == 42);
 +    CHECK(r.motion_ts_us == 1500000ull);
 +
 +    uint64_t btns = dsu_buttons(&r, 0);
