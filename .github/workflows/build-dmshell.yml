@@ -9,7 +9,7 @@ on:
 jobs:
   build-dmshell:
     name: Build iOS DmShell.app with DSU Patch
-    runs-on: macos-latest
+    runs-on: macos-14
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
