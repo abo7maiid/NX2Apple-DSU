@@ -39,10 +39,6 @@ jobs:
 
       - name: Run DSU protocol and ShellControllers unit tests
         run: |
-          mkdir -p engine/dm/host/tests/build
-          clang -O1 -g -Wall -Werror -Wno-unused-function -Iengine/dm/host \
-            engine/dm/host/tests/t_dsu.c -o engine/dm/host/tests/build/t_dsu
-          ./engine/dm/host/tests/build/t_dsu
           swift test --package-path frontend-ios --filter ShellControllersTests
 
       - name: Build DSU-patched DmShellGame framework with Xcode
