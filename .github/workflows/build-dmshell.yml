@@ -30,7 +30,7 @@ jobs:
           if ! command -v xcodegen >/dev/null 2>&1; then
             brew install xcodegen
           fi
-          python3 -m pip install --upgrade pip fonttools --break-system-packages || pip3 install fonttools
+          python3 -m pip install fonttools --break-system-packages
 
       - name: Sync nxnative engine and apply patch series (including DSU patch)
         run: |
