@@ -124,17 +124,8 @@ public struct LibraryView: View {
 
     public var body: some View {
         NavigationStack {
-            Group {
-                #if os(iOS)
-                if #available(iOS 27.0, *) {
-                    // Keep library actions available when rotation replaces the vertical scroll view with Cover Flow.
-                    content.toolbarMinimizationBehavior(.never, for: .navigationBar)
-                } else { content }
-                #else
-                content
-                #endif
-            }
-            .toolbar { libraryToolbar }
+            content
+                .toolbar { libraryToolbar }
         }
         .environment(\.shellNativeBars, true)
         .environment(\.shellFocus, focus)
@@ -707,13 +698,7 @@ private struct MenuPlacement: ViewModifier {
     var divided: Bool
     var secondary: Bool
     @ViewBuilder func body(content: Content) -> some View {
-        #if os(iOS)
-        if #available(iOS 27.0, *), divided {
-            content.presentationPlacement(secondary ? .trailing : .leading)
-        } else { content }
-        #else
         content
-        #endif
     }
 }
 

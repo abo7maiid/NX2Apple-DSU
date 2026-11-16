@@ -1152,24 +1152,12 @@ public struct ShellHostConfig: Sendable {
 
     /// True on iOS 27+ when a controller is connected and Home Button Override has not yet been deferred to the app.
     public var canOpenHomeButtonSettings: Bool {
-        #if os(iOS)
-        if #available(iOS 27.0, *), !controllers.isEmpty,
-           let status = try? GCControllerHomeButtonSettingsManager().controllerHomeButtonInAppAction {
-            return status.action != .defer && status.action != .unavailable
-        }
-        #endif
         return false
     }
 
     /// Opens the system Game Controller Home Button Override screen (or falls back to app settings).
     public func openHomeButtonSettings() {
         #if os(iOS)
-        if #available(iOS 27.0, *) {
-            do {
-                try GCControllerHomeButtonSettingsManager().openControllerHomeButtonSettings(for: .customizeInAppAction)
-                return
-            } catch {}
-        }
         if let url = URL(string: UIApplication.openSettingsURLString) {
             config.openURL(url)
         }
