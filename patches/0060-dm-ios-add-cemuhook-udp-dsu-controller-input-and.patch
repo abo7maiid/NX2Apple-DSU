@@ -1,0 +1,1091 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: NX2Apple Developer <dev@nx2apple.local>
+Date: Mon, 16 Nov 2026 19:01:54 +0300
+Subject: [PATCH] dm/ios: add Cemuhook UDP (DSU Controller) input and 6-axis
+ motion on port 26760
+
+Upstream-Status: pending
+Reason: Add Cemuhook UDP (DSU Controller) input and motion support on port 26760
+Issue: LNPANDY/NX2Apple#1
+
+---
+ dm/host/Makefile           |   2 +-
+ dm/host/dsu_proto.h        | 319 +++++++++++++++++++++++++++++++++++++
+ dm/host/hle_lifecycle.c    |   2 +
+ dm/host/pad_dsu_apple.h    |  38 +++++
+ dm/host/pad_dsu_apple.m    | 318 ++++++++++++++++++++++++++++++++++++
+ dm/host/tests/Makefile     |   5 +-
+ dm/host/tests/t_dsu.c      | 106 ++++++++++++
+ dm/ios/Sources/DmGamepad.m |  92 +++++++++--
+ dm/ios/Sources/front_ios.m |   2 +
+ 9 files changed, 872 insertions(+), 12 deletions(-)
+ create mode 100644 dm/host/dsu_proto.h
+ create mode 100644 dm/host/pad_dsu_apple.h
+ create mode 100644 dm/host/pad_dsu_apple.m
+ create mode 100644 dm/host/tests/t_dsu.c
+
+diff --git a/dm/host/Makefile b/dm/host/Makefile
+index c059b6b..b3cf152 100644
+--- a/dm/host/Makefile
++++ b/dm/host/Makefile
+@@ -26,7 +26,7 @@ ifeq ($(filter -j%,$(MAKEFLAGS)),)
+ MAKEFLAGS += -j$(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+ endif
+ # Service-layer takeover hle_*.c files are included by wildcard: adding a file does not touch this line (avoids merge conflicts)
+-SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m pad_switch2_apple.m $(sort $(wildcard hle_*.c)) front_mac.m controllers_mac.m web_apple.m entry.S
++SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m pad_switch2_apple.m pad_dsu_apple.m $(sort $(wildcard hle_*.c)) front_mac.m controllers_mac.m web_apple.m entry.S
+ # NVN null device + nn::vi + the Vulkan layer (dm/gfx/)
+ # Sources under dm/gfx, dm/gfx/nvn, dm/gfx/tex, dm/gfx/vk and dm/gfx/gl are included by wildcard (tests/ and metal/ do not go into the host): adding a file does not touch this line
+ GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))
+diff --git a/dm/host/dsu_proto.h b/dm/host/dsu_proto.h
+new file mode 100644
+index 0000000..42d01c1
+--- /dev/null
++++ b/dm/host/dsu_proto.h
+@@ -0,0 +1,319 @@
++// Cemuhook UDP (DSU Controller, protocol v1001, default port 26760) protocol parser, CRC32, and Switch coordinate mapping.
++// Pure C, no platform headers, so tests/t_dsu.c checks it on any machine; pad_dsu_apple.m is the UDP socket transport shared by
++// the Mac and iOS front ends (DmGamepad.m, controllers_mac.m).
++//
++// Specification: Cemuhook UDP Pad Motion Server protocol (version 1001, magic "DSUC" from client, "DSUS" from server, little-endian).
++// Message 0x100001 requests controller port info; Message 0x100002 requests/delivers controller data (buttons, analog sticks,
++// 2-point touch, microsecond motion timestamp, accelerometer in G, and gyroscope pitch/yaw/roll in deg/s).
++//
++// Coordinate frame conversion to Switch SixAxisSensorState / dm_motion_set_hid (G, rad/s, Switch frame: x right, y forward,
++// z up, gravity (0, 0, -1) lying flat face up):
++//   Cemuhook DSU defines:
++//     accel X: rightward acceleration (+X right)
++//     accel Y: upward/vertical acceleration (-1 G when lying flat face up in standard DSU servers)
++//     accel Z: forward/backward acceleration
++//     gyro Pitch: nose up/down (rotation around +X right, deg/s)
++//     gyro Yaw: turn left/right (rotation around vertical axis, deg/s)
++//     gyro Roll: tilt left/right (rotation around forward/backward axis, deg/s)
++//   Default mapping to Switch (x right, y forward, z up; right-handed rotations):
++//     Switch acc  = ( +dsu_acc_x, -dsu_acc_z, +dsu_acc_y )
++//     Switch gyro = ( +dsu_pitch, -dsu_roll,  -dsu_yaw   ) * (pi / 180)
++//   DM_DSU_MAP=a,b,c,d,e,f (six signed numbers in 1..6, like DM_SW2_MAP) overrides the 6-channel mapping if a particular DSU server
++//   uses different axes.
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++#include "dm_input.h"
++
++#define DSU_DEFAULT_PORT 26760
++#define DSU_PROTOCOL_VERSION 1001
++#define DSU_SLOTS 4
++
++#define DSU_MSG_VERSION 0x00100000u
++#define DSU_MSG_PORTS   0x00100001u
++#define DSU_MSG_DATA    0x00100002u
++
++enum {
++    DSU_STATE_DISCONNECTED = 0,
++    DSU_STATE_RESERVED     = 1,
++    DSU_STATE_CONNECTED    = 2,
++};
++
++enum {
++    DSU_MODEL_NONE      = 0,
++    DSU_MODEL_NO_GYRO   = 1,
++    DSU_MODEL_FULL_GYRO = 2,
++    DSU_MODEL_GENERIC   = 3,
++};
++
++enum {
++    DSU_CONN_NONE = 0,
++    DSU_CONN_USB  = 1,
++    DSU_CONN_BT   = 2,
++};
++
++// Bitmask 1 (offset 36)
++enum {
++    DSU_B1_SHARE   = 0x01,
++    DSU_B1_L3      = 0x02,
++    DSU_B1_R3      = 0x04,
++    DSU_B1_OPTIONS = 0x08,
++    DSU_B1_UP      = 0x10,
++    DSU_B1_RIGHT   = 0x20,
++    DSU_B1_DOWN    = 0x40,
++    DSU_B1_LEFT    = 0x80,
++};
++
++// Bitmask 2 (offset 37)
++enum {
++    DSU_B2_L2    = 0x01,
++    DSU_B2_R2    = 0x02,
++    DSU_B2_L1    = 0x04,
++    DSU_B2_R1    = 0x08,
++    DSU_B2_NORTH = 0x10,   // Triangle / X
++    DSU_B2_EAST  = 0x20,   // Circle / A
++    DSU_B2_SOUTH = 0x40,   // Cross / B
++    DSU_B2_WEST  = 0x80,   // Square / Y
++};
++
++static inline uint16_t dsu_u16(const uint8_t *p) { return (uint16_t)(p[0] | (uint16_t)p[1] << 8); }
++static inline uint32_t dsu_u32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++static inline uint64_t dsu_u64(const uint8_t *p) { return (uint64_t)dsu_u32(p) | (uint64_t)dsu_u32(p + 4) << 32; }
++static inline float dsu_f32(const uint8_t *p) { uint32_t u = dsu_u32(p); float f; memcpy(&f, &u, sizeof f); return f; }
++
++static inline void dsu_put_u16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
++static inline void dsu_put_u32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
++
++// Standard IEEE 802.3 CRC-32 over buf[0..len-1], treating bytes [8..11] (the CRC field itself) as zero when zero_crc_field is non-zero.
++static inline uint32_t dsu_crc32(const uint8_t *buf, size_t len, int zero_crc_field) {
++    uint32_t crc = 0xFFFFFFFFu;
++    for (size_t i = 0; i < len; i++) {
++        uint8_t b = (zero_crc_field && i >= 8 && i < 12) ? 0 : buf[i];
++        crc ^= b;
++        for (int k = 0; k < 8; k++) crc = (crc & 1) ? (0xEDB88320u ^ (crc >> 1)) : (crc >> 1);
++    }
++    return ~crc;
++}
++
++// Build a 32-byte DSUC 0x100002 controller data request packet.
++// reg_flags: 0 = subscribe to all controllers, 1 = slot-based (slot 0..3).
++static inline size_t dsu_make_data_req(uint8_t out[32], uint32_t client_id, uint8_t reg_flags, uint8_t slot) {
++    memset(out, 0, 32);
++    out[0] = 'D'; out[1] = 'S'; out[2] = 'U'; out[3] = 'C';
++    dsu_put_u16(out + 4, DSU_PROTOCOL_VERSION);
++    dsu_put_u16(out + 6, 16);   // payload length after the 16-byte header
++    dsu_put_u32(out + 12, client_id);
++    dsu_put_u32(out + 16, DSU_MSG_DATA);
++    out[20] = reg_flags;
++    out[21] = slot & 3;
++    uint32_t crc = dsu_crc32(out, 32, 1);
++    dsu_put_u32(out + 8, crc);
++    return 32;
++}
++
++// Build a 28-byte DSUC 0x100001 port info request for all 4 slots.
++static inline size_t dsu_make_ports_req(uint8_t out[28], uint32_t client_id) {
++    memset(out, 0, 28);
++    out[0] = 'D'; out[1] = 'S'; out[2] = 'U'; out[3] = 'C';
++    dsu_put_u16(out + 4, DSU_PROTOCOL_VERSION);
++    dsu_put_u16(out + 6, 12);
++    dsu_put_u32(out + 12, client_id);
++    dsu_put_u32(out + 16, DSU_MSG_PORTS);
++    dsu_put_u32(out + 20, 4);
++    out[24] = 0; out[25] = 1; out[26] = 2; out[27] = 3;
++    uint32_t crc = dsu_crc32(out, 28, 1);
++    dsu_put_u32(out + 8, crc);
++    return 28;
++}
++
++typedef struct {
++    int active;
++    uint16_t id;
++    uint16_t x, y;
++} dsu_touch_point;
++
++typedef struct {
++    uint8_t slot;
++    uint8_t state;
++    uint8_t model;
++    uint8_t conn;
++    uint8_t mac[6];
++    uint8_t battery;
++    uint8_t connected;
++    uint32_t packet_num;
++    uint8_t b1, b2, home, touch_btn;
++    uint8_t lx, ly, rx, ry;
++    uint8_t analog_dpad[4];     // left, down, right, up
++    uint8_t analog_face[4];     // E (A/Circle), S (B/Cross), N (X/Triangle), W (Y/Square)
++    uint8_t r1, l1, r2, l2;
++    dsu_touch_point touch[2];
++    uint64_t motion_ts_us;
++    float raw_motion[6];        // acc_x, acc_y, acc_z (G), pitch, yaw, roll (deg/s)
++} dsu_report;
++
++// Validate and parse a 100-byte DSUS 0x100002 controller data packet.
++// Returns 1 on valid controller data report, 0 otherwise.
++static inline int dsu_report_parse(const uint8_t *d, size_t len, dsu_report *r) {
++    if (r) memset(r, 0, sizeof *r);
++    if (!d || !r || len < 100) return 0;
++    if (d[0] != 'D' || d[1] != 'S' || d[2] != 'U' || d[3] != 'S') return 0;
++    if (dsu_u16(d + 4) != DSU_PROTOCOL_VERSION) return 0;
++    uint16_t plen = dsu_u16(d + 6);
++    if ((size_t)plen + 16 > len || plen < 84) return 0;
++    uint32_t got_crc = dsu_u32(d + 8);
++    if (dsu_crc32(d, (size_t)plen + 16, 1) != got_crc) return 0;
++    if (dsu_u32(d + 16) != DSU_MSG_DATA) return 0;
++    if (d[20] >= DSU_SLOTS) return 0;
++
++    r->slot = d[20];
++    r->state = d[21];
++    r->model = d[22];
++    r->conn = d[23];
++    memcpy(r->mac, d + 24, 6);
++    r->battery = d[30];
++    r->connected = (r->state == DSU_STATE_CONNECTED && d[31] != 0) ? 1 : 0;
++    r->packet_num = dsu_u32(d + 32);
++    r->b1 = d[36];
++    r->b2 = d[37];
++    r->home = d[38];
++    r->touch_btn = d[39];
++    r->lx = d[40]; r->ly = d[41]; r->rx = d[42]; r->ry = d[43];
++    for (int i = 0; i < 4; i++) r->analog_dpad[i] = d[44 + i];
++    r->r1 = d[48]; r->l1 = d[49]; r->r2 = d[50]; r->l2 = d[51];
++    for (int i = 0; i < 4; i++) r->analog_face[i] = d[52 + i];
++    for (int t = 0; t < 2; t++) {
++        const uint8_t *tp = d + 56 + t * 6;
++        r->touch[t].active = tp[0] != 0;
++        r->touch[t].id = tp[1];
++        r->touch[t].x = dsu_u16(tp + 2);
++        r->touch[t].y = dsu_u16(tp + 4);
++    }
++    r->motion_ts_us = dsu_u64(d + 68);
++    for (int i = 0; i < 6; i++) r->raw_motion[i] = dsu_f32(d + 76 + i * 4);
++    return 1;
++}
++
++// Convert DSU buttons and analog triggers into nn::hid NpadButton bits (DM_BTN_*).
++// If swap_ab != 0, East/South and North/West are swapped (Xbox/PlayStation label mapping instead of Switch positional mapping).
++static inline uint64_t dsu_buttons(const dsu_report *r, int swap_ab) {
++    if (!r || !r->connected) return 0;
++    uint64_t m = 0;
++    int east  = (r->b2 & DSU_B2_EAST)  || r->analog_face[0] > 128;
++    int south = (r->b2 & DSU_B2_SOUTH) || r->analog_face[1] > 128;
++    int north = (r->b2 & DSU_B2_NORTH) || r->analog_face[2] > 128;
++    int west  = (r->b2 & DSU_B2_WEST)  || r->analog_face[3] > 128;
++
++    if (swap_ab) {
++        if (south) m |= DM_BTN_A;
++        if (east)  m |= DM_BTN_B;
++        if (west)  m |= DM_BTN_X;
++        if (north) m |= DM_BTN_Y;
++    } else {
++        if (east)  m |= DM_BTN_A;
++        if (south) m |= DM_BTN_B;
++        if (north) m |= DM_BTN_X;
++        if (west)  m |= DM_BTN_Y;
++    }
++
++    if ((r->b2 & DSU_B2_L1) || r->l1 > 128) m |= DM_BTN_L;
++    if ((r->b2 & DSU_B2_R1) || r->r1 > 128) m |= DM_BTN_R;
++    if ((r->b2 & DSU_B2_L2) || r->l2 > 64)  m |= DM_BTN_ZL;
++    if ((r->b2 & DSU_B2_R2) || r->r2 > 64)  m |= DM_BTN_ZR;
++
++    if (r->b1 & DSU_B1_OPTIONS) m |= DM_BTN_PLUS;
++    if (r->b1 & DSU_B1_SHARE)   m |= DM_BTN_MINUS;
++    if (r->b1 & DSU_B1_L3)      m |= DM_BTN_LS;
++    if (r->b1 & DSU_B1_R3)      m |= DM_BTN_RS;
++
++    if ((r->b1 & DSU_B1_LEFT)  || r->analog_dpad[0] > 128) m |= DM_BTN_LEFT;
++    if ((r->b1 & DSU_B1_DOWN)  || r->analog_dpad[1] > 128) m |= DM_BTN_DOWN;
++    if ((r->b1 & DSU_B1_RIGHT) || r->analog_dpad[2] > 128) m |= DM_BTN_RIGHT;
++    if ((r->b1 & DSU_B1_UP)    || r->analog_dpad[3] > 128) m |= DM_BTN_UP;
++
++    return m;
++}
++
++static inline int32_t dsu_stick_axis(uint8_t raw) {
++    if (raw == 128) return 0;
++    float v = raw > 128 ? (float)(raw - 128) / 127.f : (float)((int)raw - 128) / 128.f;
++    if (v > 1.f) v = 1.f;
++    if (v < -1.f) v = -1.f;
++    return (int32_t)lrintf(v * DM_STICK_MAX);
++}
++
++static inline void dsu_sticks(const dsu_report *r, int32_t out[4]) {
++    if (!r || !r->connected) { out[0] = out[1] = out[2] = out[3] = 0; return; }
++    out[0] = dsu_stick_axis(r->lx);
++    out[1] = dsu_stick_axis(r->ly);
++    out[2] = dsu_stick_axis(r->rx);
++    out[3] = dsu_stick_axis(r->ry);
++}
++
++static inline int dsu_home(const dsu_report *r) {
++    return r && r->connected && (r->home & 0x01) != 0;
++}
++
++// Default 6-channel signed map from DSU raw_motion[0..5] (1:acc_x, 2:acc_y, 3:acc_z, 4:pitch, 5:yaw, 6:roll)
++// to Switch frame (acc x right, y forward, z up; gyro x pitch, y roll, z yaw).
++static const int8_t dsu_map_default[6] = {1, -3, 2, 4, -6, -5};
++#define DSU_DEG_TO_RAD (3.14159265358979323846f / 180.f)
++
++static inline int dsu_map_parse(const char *s, int8_t map[6]) {
++    int8_t m[6]; if (!s) return 0;
++    for (int i = 0; i < 6; i++) {
++        char *e; long v = strtol(s, &e, 10); if (e == s || v == 0 || v < -6 || v > 6) return 0;
++        m[i] = (int8_t)v; s = e; if (i < 5) { if (*s != ',') return 0; s++; }
++    }
++    if (*s) return 0;
++    memcpy(map, m, 6);
++    return 1;
++}
++
++// Convert DSU raw motion into Switch acceleration (G) and angular velocity (rad/s).
++// Returns 1 when the report carries finite, non-zero motion samples, 0 otherwise.
++static inline int dsu_motion_to_switch(const dsu_report *r, const int8_t map[6], float acc[3], float rot[3]) {
++    if (!r || !r->connected || r->model == DSU_MODEL_NO_GYRO) return 0;
++    int any = 0;
++    for (int i = 0; i < 6; i++) {
++        if (!isfinite(r->raw_motion[i])) return 0;
++        if (r->raw_motion[i] != 0.f) any = 1;
++    }
++    if (!any) return 0;
++    const int8_t *m = map ? map : dsu_map_default;
++    for (int i = 0; i < 6; i++) {
++        int c = m[i] < 0 ? -m[i] : m[i];
++        float sign = m[i] < 0 ? -1.f : 1.f;
++        if (c < 1 || c > 6) { c = 1; sign = 0.f; }
++        float v = sign * r->raw_motion[c - 1];
++        if (i < 3) acc[i] = v;
++        else rot[i - 3] = v * DSU_DEG_TO_RAD;
++    }
++    return 1;
++}
++
++// Track DSU microsecond timestamps and anchor them to host now_ns() for dm_motion_set_hid.
++typedef struct {
++    int have;
++    uint64_t last_us;
++    uint64_t host_ns;
++} dsu_clock;
++
++static inline uint64_t dsu_clock_sample(dsu_clock *c, uint64_t ts_us, uint64_t arrival_ns) {
++    if (!ts_us || !c->have || ts_us <= c->last_us || ts_us - c->last_us > 500000ull) {
++        c->have = 1;
++        c->last_us = ts_us;
++        c->host_ns = arrival_ns;
++        return arrival_ns;
++    }
++    uint64_t step_ns = (ts_us - c->last_us) * 1000ull;
++    uint64_t t = c->host_ns + step_ns;
++    if (t > arrival_ns) t = arrival_ns;
++    if (arrival_ns - t > 60000000ull) t = arrival_ns - 60000000ull;
++    if (t <= c->host_ns) t = c->host_ns + 1000ull;
++    c->last_us = ts_us;
++    c->host_ns = t;
++    return t;
++}
+diff --git a/dm/host/hle_lifecycle.c b/dm/host/hle_lifecycle.c
+index a9e65a0..778fd10 100644
+--- a/dm/host/hle_lifecycle.c
++++ b/dm/host/hle_lifecycle.c
+@@ -90,6 +90,7 @@ __attribute__((weak)) void dm_save_sync_stop(void) {}
+ __attribute__((weak)) void dm_haptics_apple_shutdown(void) {}
+ __attribute__((weak)) void dm_haptics_apple_teardown(void) {}
+ __attribute__((weak)) void dm_switch2_teardown(void) {}
++__attribute__((weak)) void dm_dsu_teardown(void) {}
+ __attribute__((weak)) void dm_codec_video_stop_all(void) {}
+ __attribute__((weak)) void dm_codec_video_teardown_post(void) {}
+ __attribute__((weak)) void dm_cheats_teardown(void) {}
+@@ -124,6 +125,7 @@ void dm_host_teardown_for_shell(void) {
+     dm_audio_stop_all();
+     dm_haptics_apple_teardown();
+     dm_switch2_teardown();
++    dm_dsu_teardown();
+     dm_audren_teardown_post();
+     dm_sf_teardown();
+     dm_movie_teardown_post();
+diff --git a/dm/host/pad_dsu_apple.h b/dm/host/pad_dsu_apple.h
+new file mode 100644
+index 0000000..8073f25
+--- /dev/null
++++ b/dm/host/pad_dsu_apple.h
+@@ -0,0 +1,38 @@
++// Cemuhook UDP (DSU Controller, protocol v1001, default port 26760) client transport, shared by the Mac and iOS front ends
++// (DmGamepad.m, controllers_mac.m), analogous to pad_switch2_apple.h. dsu_proto.h defines the wire protocol and coordinate mapping.
++//
++// Configuration (via environment or Documents/env.txt):
++//   DM_DSU=1 or DM_DSU=<server_ip[:port]>   Enables the DSU UDP client (default port 26760). When DM_DSU=1, the client binds to
++//                                           0.0.0.0:26760 to receive pushed DSU packets and also subscribes to 127.0.0.1:26760.
++//                                           When DM_DSU=<ip[:port]>, it binds an ephemeral/local UDP socket and sends 0x100002
++//                                           subscription requests every 2 seconds to that server.
++//   DM_DSU_PORT=<port>                      Overrides the UDP port (default 26760).
++//   DM_DSU_MAP=a,b,c,d,e,f                  Signed 1..6 channel permutation for DSU accelerometer and gyro axes.
++//   DM_DSU_VERBOSE=1                        Logs the first packet of each second per active slot.
++#pragma once
++#include "dsu_proto.h"
++
++typedef struct dsu_pad {
++    int slot;               // DSU slot 0..3
++    int active;             // 1 while connected and receiving reports
++    dsu_report r;
++    dsu_clock clk;
++    uint64_t last_rx_ns;
++    char name[48];
++} dsu_pad;
++
++// Callbacks invoked on the main queue, matching dm_switch2_front in pad_switch2_apple.h.
++typedef struct {
++    int (*attach)(dsu_pad *p);    // a new DSU slot became active: assign a player slot (1: kept, 0: all players taken)
++    void (*detach)(dsu_pad *p);   // a DSU slot disconnected or timed out
++    void (*read)(dsu_pad *p);     // the DSU pad's buttons/sticks updated
++    int (*player)(dsu_pad *p);    // 0-based player index, -1 when waiting for press-to-join
++    int (*blocked)(void);         // non-zero while focus is lost or the quit/controller prompt is open
++} dm_dsu_front;
++
++int dm_dsu_start(const dm_dsu_front *front);   // 1: started; 0: off (DM_DSU=0)
++void dm_dsu_teardown(void);                    // closes socket, stops timers and cleans up slots; safe across shell restarts
++void dm_dsu_active(int on);                    // focus lost (0): clears motion; focus restored (1): resumes
++dsu_pad *dm_dsu_pads(void);                    // array of DSU_SLOTS pads
++int dm_dsu_any_active(void);                   // 1 if at least one DSU slot is currently connected
++void dm_dsu_quit_buttons(int *home, int *a, int *b);   // Home / A / B state across active DSU slots for the quit prompt
+diff --git a/dm/host/pad_dsu_apple.m b/dm/host/pad_dsu_apple.m
+new file mode 100644
+index 0000000..d14addb
+--- /dev/null
++++ b/dm/host/pad_dsu_apple.m
+@@ -0,0 +1,318 @@
++// Cemuhook UDP (DSU Controller, port 26760) client transport for iOS and macOS.
++// Uses Grand Central Dispatch (dispatch_source_t) on the main queue so all controller callbacks run on the main thread
++// alongside GameController and Switch 2 BLE callbacks.
++#import "pad_dsu_apple.h"
++#import <Foundation/Foundation.h>
++#include "dm.h"
++#include <arpa/inet.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++#define DSU_TIMEOUT_NS 2500000000ull   // 2.5 seconds without a packet disconnects the slot
++
++static dm_dsu_front g_front;
++static dsu_pad g_pads[DSU_SLOTS];
++static int g_sock = -1;
++static dispatch_source_t g_read_src;
++static dispatch_source_t g_keepalive_timer;
++static struct sockaddr_in g_server_addr;
++static int g_has_server;
++static uint32_t g_client_id;
++static int g_active = 1, g_verbose, g_map_set;
++static int8_t g_map[6];
++static uint64_t g_last_log_ns[DSU_SLOTS];
++static _Atomic uint64_t g_dsu_gen __attribute__((section("__DATA,__dm_keep")));
++
++dsu_pad *dm_dsu_pads(void) { return g_pads; }
++
++int dm_dsu_any_active(void) {
++    for (int i = 0; i < DSU_SLOTS; i++) if (g_pads[i].active) return 1;
++    return 0;
++}
++
++void dm_dsu_quit_buttons(int *home, int *a, int *b) {
++    for (int i = 0; i < DSU_SLOTS; i++) {
++        if (!g_pads[i].active) continue;
++        if (dsu_home(&g_pads[i].r)) *home = 1;
++        dsu_ab(&g_pads[i].r, a, b);
++    }
++}
++
++static int dsu_player(dsu_pad *p) { return p && g_front.player ? g_front.player(p) : -1; }
++static int dsu_blocked(void) { return !g_active || (g_front.blocked && g_front.blocked()); }
++
++static void dsu_send_subscribe(void) {
++    if (g_sock < 0 || !g_has_server) return;
++    uint8_t req[32];
++    size_t n = dsu_make_data_req(req, g_client_id, 0, 0);
++    (void)sendto(g_sock, req, n, 0, (const struct sockaddr *)&g_server_addr, sizeof g_server_addr);
++    for (uint8_t s = 0; s < DSU_SLOTS; s++) {
++        n = dsu_make_data_req(req, g_client_id, 1, s);
++        (void)sendto(g_sock, req, n, 0, (const struct sockaddr *)&g_server_addr, sizeof g_server_addr);
++    }
++}
++
++static void dsu_slot_disconnect(dsu_pad *p, const char *reason) {
++    if (!p->active) return;
++    int pl = dsu_player(p);
++    if (pl >= 0) dm_motion_clear_hid(pl);
++    p->active = 0;
++    memset(&p->r, 0, sizeof p->r);
++    memset(&p->clk, 0, sizeof p->clk);
++    LOG("[dsu] %s disconnected (%s)", p->name, reason);
++    if (g_front.detach) g_front.detach(p);
++}
++
++static void dsu_check_timeouts(void) {
++    uint64_t now = now_ns();
++    for (int i = 0; i < DSU_SLOTS; i++) {
++        dsu_pad *p = &g_pads[i];
++        if (p->active && now > p->last_rx_ns && now - p->last_rx_ns > DSU_TIMEOUT_NS) {
++            dsu_slot_disconnect(p, "timed out");
++        }
++    }
++}
++
++static void dsu_handle_packet(const uint8_t *buf, size_t len, const struct sockaddr_in *from) {
++    dsu_report r;
++    if (!dsu_report_parse(buf, len, &r)) return;
++    dsu_pad *p = &g_pads[r.slot];
++    uint64_t now = now_ns();
++
++    // Learn the peer address if we started in passive/listen mode and received a packet
++    if (!g_has_server && from && from->sin_family == AF_INET) {
++        g_server_addr = *from;
++        g_has_server = 1;
++    }
++
++    if (!r.connected) {
++        if (p->active) dsu_slot_disconnect(p, "server reported disconnected");
++        return;
++    }
++
++    int newly_attached = 0;
++    if (!p->active) {
++        p->slot = r.slot;
++        snprintf(p->name, sizeof p->name, "DSU Controller %u", (unsigned)(r.slot + 1));
++        p->active = 1;
++        p->r = r;
++        p->last_rx_ns = now;
++        if (g_front.attach && !g_front.attach(p)) {
++            p->active = 0;
++            return;
++        }
++        newly_attached = 1;
++        int pl = dsu_player(p);
++        if (pl >= 0) LOG("[dsu] %s connected: player %d", p->name, pl + 1);
++        else LOG("[dsu] %s connected: press a button to play", p->name);
++    }
++
++    p->r = r;
++    p->last_rx_ns = now;
++
++    if (g_verbose && now - g_last_log_ns[r.slot] >= 1000000000ull) {
++        g_last_log_ns[r.slot] = now;
++        LOG("[dsu] slot %u pkt %u: b1=0x%02x b2=0x%02x sticks=(%u,%u %u,%u) acc=(%+.2f,%+.2f,%+.2f) gyro=(%+.1f,%+.1f,%+.1f)",
++            r.slot, r.packet_num, r.b1, r.b2, r.lx, r.ly, r.rx, r.ry,
++            r.raw_motion[0], r.raw_motion[1], r.raw_motion[2],
++            r.raw_motion[3], r.raw_motion[4], r.raw_motion[5]);
++    }
++
++    if (g_front.read) g_front.read(p);
++
++    int pl = dsu_player(p);
++    if (pl >= 0 && !dsu_blocked()) {
++        float acc[3], rot[3];
++        if (dsu_motion_to_switch(&r, g_map_set ? g_map : dsu_map_default, acc, rot)) {
++            uint64_t sample_ns = dsu_clock_sample(&p->clk, r.motion_ts_us, now);
++            dm_motion_set_hid(pl, acc, rot, sample_ns);
++        } else if (newly_attached) {
++            dm_motion_clear_hid(pl);
++        }
++    }
++}
++
++static void dsu_read_ready(void) {
++    if (g_sock < 0) return;
++    uint8_t buf[512];
++    struct sockaddr_in from;
++    for (int iter = 0; iter < 64; iter++) {
++        socklen_t flen = sizeof from;
++        memset(&from, 0, sizeof from);
++        ssize_t n = recvfrom(g_sock, buf, sizeof buf, 0, (struct sockaddr *)&from, &flen);
++        if (n <= 0) break;
++        dsu_handle_packet(buf, (size_t)n, &from);
++    }
++}
++
++void dm_dsu_active(int on) {
++    g_active = on;
++    if (!on) {
++        for (int i = 0; i < DSU_SLOTS; i++) {
++            if (g_pads[i].active) {
++                int pl = dsu_player(&g_pads[i]);
++                if (pl >= 0) dm_motion_clear_hid(pl);
++            }
++        }
++    }
++}
++
++static void dsu_teardown_on_main(void) {
++    if (g_keepalive_timer) {
++        dispatch_source_cancel(g_keepalive_timer);
++        g_keepalive_timer = nil;
++    }
++    if (g_read_src) {
++        dispatch_source_cancel(g_read_src);
++        g_read_src = nil;
++    } else if (g_sock >= 0) {
++        close(g_sock);
++        g_sock = -1;
++    }
++    for (int i = 0; i < DSU_SLOTS; i++) {
++        if (g_pads[i].active) {
++            int pl = dsu_player(&g_pads[i]);
++            if (pl >= 0) dm_motion_clear_hid(pl);
++            g_pads[i].active = 0;
++            if (g_front.detach) g_front.detach(&g_pads[i]);
++        }
++        memset(&g_pads[i], 0, sizeof g_pads[i]);
++    }
++    g_has_server = 0;
++    memset(&g_front, 0, sizeof g_front);
++}
++
++void dm_dsu_teardown(void) {
++    atomic_fetch_add(&g_dsu_gen, 1);
++    if ([NSThread isMainThread]) {
++        dsu_teardown_on_main();
++        return;
++    }
++    if (g_read_src || g_keepalive_timer || g_sock >= 0) {
++        dispatch_sync(dispatch_get_main_queue(), ^{ dsu_teardown_on_main(); });
++    }
++}
++
++static int parse_dsu_endpoint(const char *spec, const char *port_env, char host_out[128], uint16_t *port_out, int *passive_bind) {
++    *port_out = DSU_DEFAULT_PORT;
++    *passive_bind = 0;
++    host_out[0] = '\0';
++    if (port_env && atoi(port_env) > 0 && atoi(port_env) <= 65535) {
++        *port_out = (uint16_t)atoi(port_env);
++    }
++    if (spec && (!strcmp(spec, "0") || !strcasecmp(spec, "off"))) return 0;
++    if (!spec || !*spec || !strcmp(spec, "1") || !strcasecmp(spec, "on") || !strcasecmp(spec, "auto")) {
++        strlcpy(host_out, "127.0.0.1", 128);
++        *passive_bind = 1;
++        return 1;
++    }
++    const char *colon = strrchr(spec, ':');
++    if (colon && colon != spec) {
++        size_t hlen = (size_t)(colon - spec);
++        if (hlen >= 128) hlen = 127;
++        memcpy(host_out, spec, hlen);
++        host_out[hlen] = '\0';
++        int p = atoi(colon + 1);
++        if (p > 0 && p <= 65535) *port_out = (uint16_t)p;
++    } else {
++        strlcpy(host_out, spec, 128);
++    }
++    return 1;
++}
++
++int dm_dsu_start(const dm_dsu_front *front) {
++    const char *e = getenv("DM_DSU");
++    const char *pe = getenv("DM_DSU_PORT");
++    char host[128];
++    uint16_t port = DSU_DEFAULT_PORT;
++    int passive_bind = 0;
++    if (!parse_dsu_endpoint(e, pe, host, &port, &passive_bind)) return 0;
++
++    dm_dsu_teardown();
++    uint64_t gen = atomic_fetch_add(&g_dsu_gen, 1) + 1;
++    g_front = *front;
++    g_active = 1;
++    g_client_id = arc4random();
++    const char *ve = getenv("DM_DSU_VERBOSE");
++    g_verbose = ve && atoi(ve);
++    const char *me = getenv("DM_DSU_MAP");
++    g_map_set = 0;
++    if (me && *me && !(g_map_set = dsu_map_parse(me, g_map))) {
++        LOG("[dsu] DM_DSU_MAP='%s' is not six signed numbers in 1..6: using default map", me);
++    }
++
++    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++    if (fd < 0) {
++        LOG("[RED] [dsu] socket() failed: %s", strerror(errno));
++        return 0;
++    }
++    int flags = fcntl(fd, F_GETFL, 0);
++    if (flags >= 0) (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
++    int reuse = 1;
++    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
++#ifdef SO_REUSEPORT
++    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof reuse);
++#endif
++
++    struct sockaddr_in bind_addr;
++    memset(&bind_addr, 0, sizeof bind_addr);
++    bind_addr.sin_family = AF_INET;
++    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
++    // In passive/auto mode (DM_DSU=1), try binding port 26760 directly so a client-pushing DSU app can send straight to us;
++    // if port 26760 is already bound by a local DSU server on the same host, fall back to an ephemeral port and poll it.
++    bind_addr.sin_port = htons(passive_bind ? port : 0);
++    if (bind(fd, (const struct sockaddr *)&bind_addr, sizeof bind_addr) < 0 && passive_bind) {
++        bind_addr.sin_port = htons(0);
++        (void)bind(fd, (const struct sockaddr *)&bind_addr, sizeof bind_addr);
++    }
++
++    memset(&g_server_addr, 0, sizeof g_server_addr);
++    g_server_addr.sin_family = AF_INET;
++    g_server_addr.sin_port = htons(port);
++    if (inet_pton(AF_INET, host, &g_server_addr.sin_addr) == 1) {
++        g_has_server = 1;
++    } else {
++        struct addrinfo hints, *res = NULL;
++        memset(&hints, 0, sizeof hints);
++        hints.ai_family = AF_INET;
++        hints.ai_socktype = SOCK_DGRAM;
++        if (getaddrinfo(host, NULL, &hints, &res) == 0 && res && res->ai_addrlen >= sizeof(struct sockaddr_in)) {
++            g_server_addr.sin_addr = ((const struct sockaddr_in *)res->ai_addr)->sin_addr;
++            g_has_server = 1;
++        }
++        if (res) freeaddrinfo(res);
++    }
++
++    g_sock = fd;
++    g_read_src = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)fd, 0, dispatch_get_main_queue());
++    dispatch_source_set_event_handler(g_read_src, ^{
++        if (atomic_load(&g_dsu_gen) != gen) return;
++        dsu_read_ready();
++    });
++    dispatch_source_set_cancel_handler(g_read_src, ^{
++        if (g_sock == fd) g_sock = -1;
++        close(fd);
++    });
++    dispatch_resume(g_read_src);
++
++    g_keepalive_timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
++    dispatch_source_set_timer(g_keepalive_timer, DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC, 100 * NSEC_PER_MSEC);
++    dispatch_source_set_event_handler(g_keepalive_timer, ^{
++        if (atomic_load(&g_dsu_gen) != gen) return;
++        dsu_send_subscribe();
++        dsu_check_timeouts();
++    });
++    dispatch_resume(g_keepalive_timer);
++
++    dsu_send_subscribe();
++    LOG("[dsu] Cemuhook UDP client active (target %s:%u, client id 0x%08x)", host, (unsigned)port, g_client_id);
++    return 1;
++}
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index 7d010cc..d581d8a 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -12,7 +12,7 @@ QUIET = $(if $(findstring -fsanitize,$(SAN)),,2>/dev/null)
+ GINC = $(if $(strip $(GAME)),-I../gen/$(GAME) -I../../games/$(GAME),$(error GAME is not set: make GAME=<base game title ID>: $(shell python3 ../../games/game.py list | awk -F'\t' '{printf "%s (%s)  ", $$1, $$3}')))
+ $(B)/t_fs $(B)/t_fs_case $(B)/t_fs_commit_list $(B)/t_fs_commit_list_tsan: ../romfs_image.h
+ GAME_H = ../gen/$(GAME)/game_profile.h
+-run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_clockwait $(B)/t_pause $(B)/t_pause_stress $(B)/t_pctl $(B)/t_sf $(B)/t_audren_sv $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid $(B)/t_switch2 $(B)/t_input_map $(B)/t_launcher_contract $(B)/t_profile_runtime
++run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_fs $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_clockwait $(B)/t_pause $(B)/t_pause_stress $(B)/t_pctl $(B)/t_sf $(B)/t_audren_sv $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid $(B)/t_switch2 $(B)/t_dsu $(B)/t_input_map $(B)/t_launcher_contract $(B)/t_profile_runtime
+ 	$(B)/t_language
+ 	$(B)/t_heap_size
+ 	$(B)/t_touch
+@@ -79,6 +79,7 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
+ 	$(B)/t_pad_hid_mac
+ 	$(B)/t_pad_pro
+ 	$(B)/t_switch2
++	$(B)/t_dsu
+ 	$(B)/t_input_map
+ 	$(B)/t_launcher_contract
+ 	$(B)/t_haptics
+@@ -444,6 +445,8 @@ $(B)/t_pad_pro: t_pad_pro.c ../pad_pro.h ../dm_input.h | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_pad_pro.c
+ $(B)/t_switch2: t_switch2.c ../switch2_proto.h ../dm_input.h | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_switch2.c
++$(B)/t_dsu: t_dsu.c ../dsu_proto.h ../dm_input.h | $(B)
++	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_dsu.c
+ 
+ # Line coverage (../../sanitizers/coverage.mk): make coverage builds every test of run into $(B)/cov with COV_FLAGS, runs them and writes $(B)/cov/coverage.lcov.
+ # It measures, it does not test: make -i runs every test even after one fails (the plain run reports that), so the coverage of the others is kept.
+diff --git a/dm/host/tests/t_dsu.c b/dm/host/tests/t_dsu.c
+new file mode 100644
+index 0000000..c387a5c
+--- /dev/null
++++ b/dm/host/tests/t_dsu.c
+@@ -0,0 +1,106 @@
++// Cemuhook UDP (DSU Controller, dsu_proto.h) protocol framing, CRC32, button/stick decoding, and 6-axis motion conversion tests.
++#include <stdio.h>
++#include <stdlib.h>
++#include "../dsu_proto.h"
++
++static int checks, fails;
++#define CHECK(c) do { checks++; if (!(c)) { fails++; printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } } while (0)
++
++int main(void) {
++    // 1. IEEE 802.3 CRC32 standard vector ("123456789" -> 0xCBF43926)
++    const uint8_t vec[] = "123456789";
++    CHECK(dsu_crc32(vec, 9) == 0xCBF43926u);
++
++    // 2. Client subscription request packet (0x100002) and controller info request (0x100001)
++    uint8_t req[32];
++    size_t n = dsu_make_data_req(req, 0x11223344u, 1, 2);
++    CHECK(n == 28);
++    CHECK(memcmp(req, "DSUC", 4) == 0 && dsu_u16(req + 4) == DSU_VERSION && dsu_u16(req + 6) == 12);
++    CHECK(dsu_u32(req + 12) == 0x11223344u && dsu_u32(req + 16) == DSU_TYPE_DATA && req[20] == 1 && req[21] == 2);
++    uint32_t pkt_crc = dsu_u32(req + 8);
++    dsu_put_u32(req + 8, 0);
++    CHECK(dsu_crc32(req, n) == pkt_crc);
++
++    size_t pn = dsu_make_ports_req(req, 0xAABBCCDDu);
++    CHECK(pn == 28 && dsu_u32(req + 16) == DSU_TYPE_PORTS && dsu_u32(req + 20) == 4);
++
++    // 3. Server 0x100002 controller data packet parsing, buttons, sticks, and 6-axis motion
++    uint8_t pkt[100];
++    memset(pkt, 0, sizeof pkt);
++    memcpy(pkt, "DSUS", 4);
++    dsu_put_u16(pkt + 4, DSU_VERSION);
++    dsu_put_u16(pkt + 6, 84); // 100 - 16
++    dsu_put_u32(pkt + 12, 0xCAFEBABEu);
++    dsu_put_u32(pkt + 16, DSU_TYPE_DATA);
++
++    pkt[20] = 0; // slot 0
++    pkt[21] = 2; // connected
++    pkt[22] = 2; // full gyro
++    pkt[23] = 2; // bluetooth
++    pkt[30] = 5; // battery full
++    pkt[31] = 1; // is_active
++    dsu_put_u32(pkt + 32, 42); // packet number
++    pkt[36] = 0x80 | 0x08 | 0x02; // D-pad Left (0x80), Start/+ (0x08), L3 (0x02)
++    pkt[37] = 0x20 | 0x40 | 0x02 | 0x04; // East/A (0x20), South/B (0x40), R2/ZR (0x02), L1/L (0x04)
++    pkt[38] = 0x01; // Home/PS
++    pkt[40] = 255;  // LX full right (+32767)
++    pkt[41] = 0;    // LY full down (-32767)
++    pkt[42] = 128;  // RX center (0)
++    pkt[43] = 255;  // RY full up (+32767)
++
++    // Motion timestamp: 1,500,000 us
++    dsu_put_u32(pkt + 56, 1500000u);
++    dsu_put_u32(pkt + 60, 0u);
++    // DSU accel: ax = 0, ay = -1.0 G (flat on table), az = 0
++    // DSU gyro: pitch = +90 deg/s, yaw = -180 deg/s, roll = +45 deg/s
++    float motion[6] = {0.0f, -1.0f, 0.0f, 90.0f, -180.0f, 45.0f};
++    for (int i = 0; i < 6; i++) {
++        uint32_t bits;
++        memcpy(&bits, &motion[i], 4);
++        dsu_put_u32(pkt + 64 + i * 4, bits);
++    }
++    dsu_put_u32(pkt + 8, dsu_crc32(pkt, sizeof pkt));
++
++    dsu_report r;
++    CHECK(dsu_report_parse(pkt, sizeof pkt, &r));
++    CHECK(r.slot == 0 && r.connected == 1 && r.motion_ok == 1 && r.packet_num == 42);
++    CHECK(r.motion_ts_us == 1500000ull);
++
++    uint64_t btns = dsu_buttons(&r, 0);
++    CHECK((btns & DM_BTN_A) && (btns & DM_BTN_B) && !(btns & DM_BTN_X) && !(btns & DM_BTN_Y));
++    CHECK((btns & DM_BTN_LEFT) && (btns & DM_BTN_PLUS) && (btns & DM_BTN_LS) && (btns & DM_BTN_ZR) && (btns & DM_BTN_L));
++
++    int a = 0, b = 0;
++    dsu_ab(&r, &a, &b);
++    CHECK(a == 1 && b == 1 && dsu_home(&r) == 1);
++
++    int32_t st[4];
++    dsu_sticks(&r, st);
++    CHECK(st[0] == 32767 && st[1] == -32767 && st[2] == 0 && st[3] == 32767);
++
++    float acc[3], rot[3];
++    CHECK(dsu_motion_to_switch(&r, dsu_map_default, acc, rot));
++    // Default map {-1, -3, -2, 4, -6, 5}:
++    // acc = (-ax, -az, -ay) = (0, 0, +1.0)
++    // rot = (+pitch, -roll, +yaw) * pi/180 = (+pi/2, -pi/4, -pi)
++    CHECK(fabsf(acc[0]) < 1e-5f && fabsf(acc[1]) < 1e-5f && fabsf(acc[2] - 1.0f) < 1e-5f);
++    CHECK(fabsf(rot[0] - 1.5707963f) < 1e-4f && fabsf(rot[1] + 0.7853982f) < 1e-4f && fabsf(rot[2] + 3.1415927f) < 1e-4f);
++
++    // 4. Corrupted CRC32 is rejected
++    pkt[40] ^= 0x01;
++    CHECK(!dsu_report_parse(pkt, sizeof pkt, &r));
++
++    // 5. Custom DM_DSU_MAP parsing and clock sample pacing
++    int8_t custom_map[6];
++    CHECK(dsu_map_parse("-1,-3,-2,4,-6,5", custom_map) && memcmp(custom_map, dsu_map_default, 6) == 0);
++    CHECK(!dsu_map_parse("1,2,3,4,5,5", custom_map) && !dsu_map_parse("1,2,3", custom_map));
++
++    dsu_clock clk = {0};
++    uint64_t t0 = 1000000000ull;
++    CHECK(dsu_clock_sample(&clk, 1000, t0) == t0);
++    CHECK(dsu_clock_sample(&clk, 5000, t0 + 4000000ull) == t0 + 4000000ull);
++
++    if (fails) { printf("FAILED %d/%d checks\n", fails, checks); return 1; }
++    printf("t_dsu: %d checks passed\n", checks);
++    return 0;
++}
+diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
+index 9860743..81c0254 100644
+--- a/dm/ios/Sources/DmGamepad.m
++++ b/dm/ios/Sources/DmGamepad.m
+@@ -31,6 +31,7 @@
+ #include "motion_apple.h"
+ #include "motion_fusion.h"
+ #include "pad_apple.h"
++#include "pad_dsu_apple.h"
+ #include "pad_slots.h"
+ #include "ctrl_prompt.h"
+ #include "input_map.h"
+@@ -615,12 +616,18 @@ static BOOL g_hintShown;   // once per launch
+ // no player until one of its buttons is pressed, then it is the lowest player free (pad_slot_take_lowest), as on the Mac: the players choose their order
+ static pad_slots g_slots;
+ static GCController *g_held[DM_PLAYERS];   // the controller of each slot, kept alive while it holds it (the slot table keys on its pointer)
++static dsu_pad *g_dsu_held[DM_PLAYERS];    // Cemuhook UDP (DSU, port 26760) controller holding each slot (pad_dsu_apple.h)
+ static int g_merge, g_press_to_join;
+ static pad_map g_padmap;   // DM_PAD_MAP affects physical controllers only
+ static int32_t axis(float v) { return (int32_t)(fmaxf(-1.f, fminf(1.f, v)) * 32767); }
+ static const char *pad_name(GCController *c);
+ static void npad_name(int p, char *out, size_t cap);
+ static int cp_poll(void);
++static int dsu_attach(dsu_pad *pad);
++static void dsu_detach(dsu_pad *pad);
++static void dsu_read(dsu_pad *pad);
++static int dsu_player(dsu_pad *pad);
++static int dsu_blocked(void);
+ static void read_pad(GCExtendedGamepad *g) {
+     front_ios_quit_poll(); if (front_ios_quit_blocks_input()) return;   // the quit prompt has the controllers (Home held 2 s, or Quit in the in-game menu)
+     int p = g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)g.controller); if (p < 0 && !g_press_to_join) return;
+@@ -659,6 +666,8 @@ static void pads_start(void) {
+     e = getenv("DM_PAD_PRESS_TO_JOIN"); g_press_to_join = !g_merge && e && atoi(e);
+     LOG("front end: %s", g_merge ? "every controller is player 1 (DM_PAD_MERGE)" : "each controller is a player of its own, the touch gamepad plays with player 1");
+     if (g_press_to_join) LOG("front end: a controller becomes a player at its first button press, the lowest player free (DM_PAD_PRESS_TO_JOIN)");
++    static const dm_dsu_front dsu_front = {dsu_attach, dsu_detach, dsu_read, dsu_player, dsu_blocked};
++    dm_dsu_start(&dsu_front);
+ }
+ // Called at start and on every connect / disconnect (gone: the controller that was just removed, nil otherwise); returns whether a controller is in use
+ static BOOL pads_merged(GCController *gone) {
+@@ -672,8 +681,9 @@ static BOOL pads_merged(GCController *gone) {
+         read_pad(c.extendedGamepad);
+     }
+     if (!any || !motion) dm_motion_clear(0);   // the phone's gyro (if on) takes over from its next sample
+-    if (!any) { dm_haptics_apple_controller(0, nil); dm_pad_set(0, 0, 0, 0, 0); }
+-    return any;
++    if (!any) dm_haptics_apple_controller(0, nil);
++    if (!any && !dm_dsu_any_active()) dm_pad_set(0, 0, 0, 0, 0);
++    return any || dm_dsu_any_active();
+ }
+ static BOOL pads_slotted(GCController *gone) {
+     NSArray<GCController *> *now = GCController.controllers; char nb[16]; BOOL waiting = NO;
+@@ -703,7 +713,7 @@ static BOOL pads_slotted(GCController *gone) {
+     }
+     dm_pad_players(pad_slot_mask(&g_slots));
+     dispatch_async(dispatch_get_main_queue(), ^{ cp_poll(); });   // a controller came or went while the controller applet's prompt is up
+-    return waiting || pad_slot_mask(&g_slots) != 0;   // a controller waiting for its first press hides the touch gamepad too
++    return waiting || dm_dsu_any_active() || pad_slot_mask(&g_slots) != 0;   // a controller waiting for its first press hides the touch gamepad too
+ }
+ - (void)hidePadHintNow {
+     [_padHint.layer removeAllAnimations];
+@@ -866,12 +876,64 @@ static DmCtrlPrompt *g_cp_target;
+ static void cp_buttons(int *a, int *b) {
+     *a = *b = 0;
+     for (GCController *c in GCController.controllers) { GCExtendedGamepad *g = c.extendedGamepad; if (g) { *a |= g.buttonA.isPressed; *b |= g.buttonB.isPressed; } }
++    const dsu_pad *dp = dm_dsu_pads();
++    for (int i = 0; i < DSU_SLOTS; i++) if (dp[i].active) dsu_ab(&dp[i].r, a, b);
+ }
+ static int cp_waiting(void) {   // connected controllers that are no player yet
+     int n = 0;
+-    if (!g_merge) for (GCController *c in GCController.controllers) if (c.extendedGamepad && pad_slot_of(&g_slots, (__bridge const void *)c) < 0) n++;
++    if (!g_merge) {
++        for (GCController *c in GCController.controllers) if (c.extendedGamepad && pad_slot_of(&g_slots, (__bridge const void *)c) < 0) n++;
++        const dsu_pad *dp = dm_dsu_pads();
++        for (int i = 0; i < DSU_SLOTS; i++) if (dp[i].active && pad_slot_of(&g_slots, &dp[i]) < 0) n++;
++    }
+     return n;
+ }
++static int dsu_player(dsu_pad *pad) { return g_merge ? 0 : pad ? pad_slot_of(&g_slots, pad) : -1; }
++static int dsu_blocked(void) { return front_ios_quit_blocks_input() || cp_blocks_input(g_cp.phase); }
++static void dsu_read(dsu_pad *pad) {
++    if (!pad || !pad->active) return;
++    front_ios_quit_poll(); if (front_ios_quit_blocks_input()) return;
++    int p = g_merge ? 0 : pad_slot_of(&g_slots, pad); if (p < 0 && !g_press_to_join) return;
++    uint64_t m = dsu_buttons(&pad->r, 0);
++    int32_t st[4]; dsu_sticks(&pad->r, st);
++    if (p < 0) {
++        char nb[16];
++        if (!m) return;
++        if ((p = pad_slot_take_lowest(&g_slots, pad, pad->name)) < 0) { LOG("controller '%s': a button pressed, but all %d players are taken", pad->name, DM_PLAYERS); return; }
++        g_dsu_held[p] = pad; dm_pad_players(pad_slot_mask(&g_slots));
++        npad_name(p, nb, sizeof nb); LOG("controller '%s': a button pressed: player %d (npad %s)", pad->name, p + 1, nb);
++    }
++    if (cp_poll()) return;
++    m = pad_map_apply(&g_padmap, m);
++    dm_pad_set_player(p, m, st[0], st[1], st[2], st[3]);
++}
++static int dsu_attach(dsu_pad *pad) {
++    if (!g_merge) {
++        if (g_press_to_join) {
++            [g_view padsChanged:nil];
++            return 1;
++        }
++        int p = pad_slot_take(&g_slots, pad, pad->name);
++        if (p < 0) { LOG("controller '%s' connected: all %d players are taken, not used", pad->name, DM_PLAYERS); return 0; }
++        g_dsu_held[p] = pad;
++        dm_pad_players(pad_slot_mask(&g_slots));
++    }
++    [g_view padsChanged:nil];
++    return 1;
++}
++static void dsu_detach(dsu_pad *pad) {
++    if (!g_merge) {
++        int p = pad_slot_of(&g_slots, pad);
++        if (p >= 0) {
++            char nb[16]; npad_name(p, nb, sizeof nb);
++            LOG("controller '%s' disconnected: player %d (npad %s) is free", pad->name, p + 1, nb);
++            pad_slot_free(&g_slots, pad); g_dsu_held[p] = NULL;
++            dm_pad_set_player(p, 0, 0, 0, 0, 0);
++            dm_pad_players(pad_slot_mask(&g_slots));
++        }
++    }
++    [g_view padsChanged:nil];
++}
+ static UILabel *cp_label(const char *text, CGFloat size, UIFontWeight w, CGFloat alpha) {
+     UILabel *l = [UILabel new]; l.text = @(text); l.font = [UIFont systemFontOfSize:size weight:w]; l.textColor = [UIColor colorWithWhite:1 alpha:alpha];
+     l.numberOfLines = 0; l.textAlignment = NSTextAlignmentCenter; return l;
+@@ -944,7 +1006,7 @@ int front_ctrl_support(int min, int max) {
+     dispatch_async(dispatch_get_main_queue(), ^{
+         if (!g_view || !front_metal_layer()) { g_cp_ok = 0; dispatch_semaphore_signal(done); return; }
+         [g_view reset]; dm_touch_set(NULL, 0);   // nothing the game held stays pressed while the prompt has the input
+-        if (g_merge) dm_pad_set(0, 0, 0, 0, 0); else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p]) dm_pad_set_player(p, 0, 0, 0, 0, 0);
++        if (g_merge) dm_pad_set(0, 0, 0, 0, 0); else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p] || g_dsu_held[p]) dm_pad_set_player(p, 0, 0, 0, 0, 0);
+         int a, b; cp_buttons(&a, &b);
+         g_cp_done = done; cp_open(&g_cp, min, max, dm_players_reported(), a, b);
+         LOG("front end: controller prompt open: %d to %d players wanted, %d in, %d controllers waiting to join", min, max, g_cp.joined, cp_waiting());
+@@ -962,18 +1024,27 @@ int dm_pad_layout(void) { return g_view ? [g_view padLayout] : 0; }
+ bool dm_pad_layout_offered(int layout) { return layout == 0 || layout == 1 || (layout == 2 && dm_opmode() == 0); }
+ void dm_pad_layout_set(int layout) { [g_view setPadLayout:layout]; }
+ void dm_gamepad_pads_read(void) {   // front_ios.m: the quit prompt closed, the game reads every controller as it is now (a button held through it counts again)
+-    if (g_merge) { for (GCController *c in GCController.controllers) if (c.extendedGamepad) read_pad(c.extendedGamepad); }
+-    else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p].extendedGamepad) read_pad(g_held[p].extendedGamepad);
++    if (g_merge) {
++        for (GCController *c in GCController.controllers) if (c.extendedGamepad) read_pad(c.extendedGamepad);
++        dsu_pad *dp = dm_dsu_pads();
++        for (int i = 0; i < DSU_SLOTS; i++) if (dp[i].active) dsu_read(&dp[i]);
++    } else {
++        for (int p = 0; p < DM_PLAYERS; p++) {
++            if (g_held[p].extendedGamepad) read_pad(g_held[p].extendedGamepad);
++            else if (g_dsu_held[p] && g_dsu_held[p]->active) dsu_read(g_dsu_held[p]);
++        }
++    }
+ }
+-void dm_gamepad_active(void) { dispatch_async(dispatch_get_main_queue(), ^{ for (GCController *c in GCController.controllers) dm_motion_rearm(c); }); }   // On become active: motion_apple.h
++void dm_gamepad_active(void) { dispatch_async(dispatch_get_main_queue(), ^{ dm_dsu_active(1); for (GCController *c in GCController.controllers) dm_motion_rearm(c); }); }   // On become active: motion_apple.h
+ void dm_gamepad_reset(void) {   // On resign active: release everything (a key held while switching away and released in background gets no "release")
+-    dispatch_async(dispatch_get_main_queue(), ^{ [g_view reset]; });
++    dispatch_async(dispatch_get_main_queue(), ^{ dm_dsu_active(0); [g_view reset]; });
+     pthread_mutex_lock(&g_mu); g_shake_btn = 0; pthread_mutex_unlock(&g_mu); publish();
+     if (g_merge) dm_pad_set(0, 0, 0, 0, 0);
+-    else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p]) dm_pad_set_player(p, 0, 0, 0, 0, 0);
++    else for (int p = 0; p < DM_PLAYERS; p++) if (g_held[p] || g_dsu_held[p]) dm_pad_set_player(p, 0, 0, 0, 0, 0);
+ }
+ __attribute__((weak)) void dm_switch2_teardown(void);
+ void dm_gamepad_teardown(void) {
++    dm_dsu_teardown();
+     if (dm_switch2_teardown) dm_switch2_teardown();
+     if (g_motion) {
+         [g_motion stopAccelerometerUpdates];
+@@ -996,6 +1067,7 @@ void dm_gamepad_teardown(void) {
+     for (int p = 0; p < DM_PLAYERS; p++) {
+         dm_haptics_apple_controller(p, nil);
+         g_held[p] = nil;
++        g_dsu_held[p] = NULL;
+     }
+     k_idle = nil; k_on = nil; k_line = nil; k_ringFill = nil; k_text = nil; k_textOn = nil;
+ }
+diff --git a/dm/ios/Sources/front_ios.m b/dm/ios/Sources/front_ios.m
+index e2901fa..9ebe7ae 100644
+--- a/dm/ios/Sources/front_ios.m
++++ b/dm/ios/Sources/front_ios.m
+@@ -16,6 +16,7 @@
+ #include "haptics_apple.h"
+ #include "save_sync.h"
+ #include "home_quit.h"
++#include "pad_dsu_apple.h"
+ #import <GameController/GameController.h>
+ #import "CloudSaves.h"
+ #import "quit_prompt.h"
+@@ -659,6 +660,7 @@ static void quit_buttons(int *home, int *a, int *b, GCController *__strong *hold
+         if (hq_pad_home(g.buttonHome.isPressed, g.buttonOptions.isPressed, g.buttonMenu.isPressed)) { *home = 1; if (!*holder) *holder = c; }
+         *a |= g.buttonA.isPressed; *b |= g.buttonB.isPressed;
+     }
++    dm_dsu_quit_buttons(home, a, b);
+ }
+ static void quit_hide_hold(void) { [g_hq_timer invalidate]; g_hq_timer = nil; [g_hq_hold removeFromSuperlayer]; g_hq_hold = nil; g_hq_ring = nil; }
+ static void quit_hide_prompt(void) {

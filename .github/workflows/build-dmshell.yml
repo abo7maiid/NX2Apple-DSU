@@ -1,0 +1,181 @@
+name: Build DmShell (DSU Controller)
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-dmshell:
+    name: Build iOS DmShell.app with DSU Patch
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select latest Xcode
+        run: |
+          if [ -d /Applications/Xcode_27.2.app ]; then
+            sudo xcode-select -s /Applications/Xcode_27.2.app
+          elif ls -d /Applications/Xcode*.app >/dev/null 2>&1; then
+            LATEST_XCODE="$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)"
+            sudo xcode-select -s "$LATEST_XCODE"
+          fi
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install build dependencies
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          python3 -m pip install --upgrade pip fonttools --break-system-packages || pip3 install fonttools
+
+      - name: Sync nxnative engine and apply patch series (including DSU patch)
+        run: |
+          python3 tools/engine.py sync
+          python3 tools/engine.py check
+
+      - name: Run DSU protocol and ShellControllers unit tests
+        run: |
+          mkdir -p engine/dm/host/tests/build
+          clang -O1 -g -Wall -Werror -Wno-unused-function -Iengine/dm/host \
+            engine/dm/host/tests/t_dsu.c -o engine/dm/host/tests/build/t_dsu
+          ./engine/dm/host/tests/build/t_dsu
+          swift test --package-path frontend-ios --filter ShellControllersTests
+
+      - name: Build DSU-patched DmShellGame framework with Xcode
+        run: |
+          set -euo pipefail
+          REPO_ROOT="$PWD"
+          ENGINE_DIR="$REPO_ROOT/engine"
+          GAME="010015100B514000"
+          FW_NAME="DmGame${GAME}"
+          WORK_DIR="$RUNNER_TEMP/dm_fw_build"
+          PROJECT_DIR="$WORK_DIR/project"
+          GEN_DIR="$PROJECT_DIR/Gen"
+          PATCHED_DIR="$WORK_DIR/patched"
+          DERIVED_DIR="$WORK_DIR/derived"
+
+          rm -rf "$WORK_DIR"
+          mkdir -p "$GEN_DIR/dm" "$GEN_DIR/Assets.xcassets" "$PATCHED_DIR"
+          printf '{"info":{"author":"xcode","version":1}}\n' > "$GEN_DIR/Assets.xcassets/Contents.json"
+
+          for name in Sources tools framework Shell; do
+            ln -s "$ENGINE_DIR/dm/ios/$name" "$PROJECT_DIR/$name"
+          done
+          cp "$ENGINE_DIR/dm/ios/project-framework.yml" "$PROJECT_DIR/project.yml"
+
+          # Create stand-in module sections so DmShellGame links the full iOS host + DSU engine layer
+          python3 -c '
+          from pathlib import Path
+          import sys
+          p = Path(sys.argv[1])
+          for name in ("main", "nrotest"):
+              (p / f"{name}.patched.bin").write_bytes(bytes(0x10000))
+              (p / f"{name}.fixups.tsv").write_text("# TEXT_END 0x4000\n# PATCH_OFF 0xc000\n# KEY_PAGE_OFF 0x8000\n# KEY_PAGE_SIZE 0x4000\n")
+          (p / "nro.tsv").write_text("nrotest\tfixture.nro\n")
+          ' "$PATCHED_DIR"
+
+          EMBED_FLAGS="$(python3 "$ENGINE_DIR/dm/ios/tools/gen_embed.py" "$PATCHED_DIR" "$GEN_DIR/embed.S" main nrotest)"
+
+          export GAME="$GAME"
+          export DM_GAME="$GAME"
+          export DM_BUNDLE_ID="org.nxnative.shell"
+          export DM_DISPLAY_NAME="Documents"
+          export DM_APP_VERSION="1.0"
+          export DM_APP_CATEGORY="action"
+          export DM_TEAM_ID=""
+          export DM_SCHEME_NAME="DmIOS"
+          export DM_APPICON=""
+          export DM_SHOW_FPS="NO"
+          export DM_LANG="en-US"
+
+          BUILD_CFG="$(python3 "$ENGINE_DIR/dm/ios/tools/gen_build.py" "$ENGINE_DIR/dm/host" "$GEN_DIR")"
+          NS_TAG="$(python3 "$ENGINE_DIR/dm/ios/tools/gen_objc_namespace.py" --print-tag --game "$GAME" \
+            --framework-name "$FW_NAME" \
+            --header "$GEN_DIR/framework/objc_namespace.h" \
+            --exports "$GEN_DIR/framework/exported_symbols.txt")"
+
+          {
+            printf '%s\n' "$BUILD_CFG"
+            printf 'DM_NS_TAG = %s\n' "$NS_TAG"
+            printf 'OTHER_LDFLAGS = $(inherited) $(DM_FRAMEWORKS) %s\n' "$EMBED_FLAGS"
+          } > "$GEN_DIR/dm.xcconfig"
+          printf 'OTHER_LDFLAGS = $(inherited) %s\n' "$EMBED_FLAGS" > "$GEN_DIR/framework.xcconfig"
+
+          mkdir -p "$GEN_DIR/framework/dm"
+          for name in main.fixups.tsv nrotest.fixups.tsv nro.tsv; do
+            cp "$PATCHED_DIR/$name" "$GEN_DIR/dm/$name"
+            cp "$PATCHED_DIR/$name" "$GEN_DIR/framework/dm/$name"
+          done
+          printf 'key\tfixture\n' > "$GEN_DIR/dm/shader_map.tsv"
+          cp "$GEN_DIR/dm/shader_map.tsv" "$GEN_DIR/framework/dm/shader_map.tsv"
+
+          python3 "$ENGINE_DIR/dm/games/game.py" profile "$GAME" "$GEN_DIR/framework/profile.tsv"
+          GFXAPI="nvn" python3 "$ENGINE_DIR/dm/games/settings.py" "$GAME" "$PATCHED_DIR" "" "$GEN_DIR/framework/dm/launcher.json"
+
+          CHAIN="$(python3 -c '
+          from pathlib import Path
+          for line in Path("engine/dm/gfx/nvn/dmsh_chain.h").read_text().splitlines():
+              if line.startswith("#define DMSH_CHAIN \""):
+                  print(line.split("\"")[1])
+                  break
+          ')"
+
+          python3 "$ENGINE_DIR/dm/ios/tools/gen_manifest.py" "$GEN_DIR/framework/game.manifest.json" \
+            --game "$GAME" \
+            --name "DSU Controller Shell Target" \
+            --display-version "1.0" \
+            --package-version "v0" \
+            --modules "main" \
+            --nro-table "$PATCHED_DIR/nro.tsv" \
+            --chain "b-$CHAIN" \
+            --romfs-marker "marker" \
+            --framework-name "$FW_NAME" \
+            --loader "FH"
+
+          (cd "$PROJECT_DIR" && xcodegen generate)
+          xcodebuild -project "$PROJECT_DIR/DmIOS.xcodeproj" \
+            -target DmShellGame \
+            -configuration Release \
+            -sdk iphoneos \
+            "PRODUCT_NAME=$FW_NAME" \
+            "PRODUCT_BUNDLE_IDENTIFIER=org.nxnative.shell.game" \
+            "SYMROOT=$DERIVED_DIR/Build/Products" \
+            "OBJROOT=$DERIVED_DIR/Build/Intermediates.noindex" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            build
+
+          FW_PATH="$DERIVED_DIR/Build/Products/Release-iphoneos/${FW_NAME}.framework"
+          nm "$FW_PATH/$FW_NAME" | grep -q "_dm_dsu_start"
+          echo "Verified _dm_dsu_start symbol linked in $FW_PATH/$FW_NAME"
+
+      - name: Compile DmShell.app with Xcode
+        run: |
+          set -euo pipefail
+          GAME="010015100B514000"
+          FW_PATH="$RUNNER_TEMP/dm_fw_build/derived/Build/Products/Release-iphoneos/DmGame${GAME}.framework"
+          export SHELL_DIR="$RUNNER_TEMP/dmshell_out"
+          export DM_SHELL_FRAMEWORKS="$FW_PATH"
+          export DM_BUNDLE_ID="org.nxnative.shell"
+          export DM_DISPLAY_NAME="NX2Apple"
+          export DM_APP_VERSION="1.0"
+          export DM_TEAM_ID=""
+
+          bash frontend-ios/Shell/build_shell.sh --build
+
+          test -d "$SHELL_DIR/DmShell.app"
+          test -f "$SHELL_DIR/DmShell.app/DmShell"
+          file "$SHELL_DIR/DmShell.app/DmShell"
+
+      - name: Upload DmShell.app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DmShell.app
+          path: ${{ runner.temp }}/dmshell_out/DmShell.app
+          include-hidden-files: true
+          if-no-files-found: error

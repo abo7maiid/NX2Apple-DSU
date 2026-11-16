@@ -32,10 +32,17 @@ public struct ConnectedController: Equatable, Sendable {
     }
     private func reportFirstSnapshot() {
         guard let onSnapshot else { return }
-        onSnapshot(GCController.controllers().first.map { Self.snapshot(of: $0.physicalInputProfile, name: Self.name(of: $0)) })
+        if let firstGc = GCController.controllers().first {
+            onSnapshot(Self.snapshot(of: firstGc.physicalInputProfile, name: Self.name(of: firstGc)))
+        } else if let firstDsu = dsuClient.activeSlots.first {
+            onSnapshot(firstDsu.snapshot)
+        } else {
+            onSnapshot(nil)
+        }
     }
 
     private var mapper = PadMapper()
+    private let dsuClient = DsuShellClient()
     private var observers: [NSObjectProtocol] = []
     private var repeatTask: Task<Void, Never>?
     private var repeating: (action: ShellInput.Action, controller: String)?
@@ -45,6 +52,26 @@ public struct ConnectedController: Equatable, Sendable {
 
     public func start() {
         stop()
+        dsuClient.onSlotPacket = { [weak self] pkt in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let id = "dsu-\(pkt.slot)"
+                if pkt.connected {
+                    self.onSnapshot?(pkt.snapshot)
+                    self.read(pkt.padState, controller: id, family: .nintendo)
+                } else {
+                    self.mapper.reset(controller: id)
+                    if self.repeating?.controller == id { self.stopRepeat() }
+                }
+            }
+        }
+        dsuClient.onSlotsChanged = { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.publish()
+                self?.reportFirstSnapshot()
+            }
+        }
+        dsuClient.start()
         let center = NotificationCenter.default
         for name in [Notification.Name.GCControllerDidConnect, .GCControllerDidDisconnect] {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
@@ -72,6 +99,7 @@ public struct ConnectedController: Equatable, Sendable {
     }
 
     public func stop() {
+        dsuClient.stop()
         observers.forEach(NotificationCenter.default.removeObserver)
         observers.removeAll()
         for pad in GCController.controllers() { pad.physicalInputProfile.valueDidChangeHandler = nil }
@@ -174,13 +202,25 @@ public struct ConnectedController: Equatable, Sendable {
 
     private func publish() {
         let pads = GCController.controllers()
-        onControllersChange(pads.enumerated().map { index, pad in
+        var list: [ConnectedController] = pads.enumerated().map { index, pad in
             let battery = pad.battery
             let level = battery.map { Int(($0.batteryLevel * 100).rounded()) }
             return ConnectedController(id: Self.id(of: pad), name: pad.vendorName ?? pad.productCategory,
                                        player: index + 1, family: ControllerFamily(productCategory: pad.productCategory),
                                        batteryPercent: battery?.batteryState == .unknown ? nil : level,
                                        charging: battery?.batteryState == .charging)
-        })
+        }
+        for pkt in dsuClient.activeSlots {
+            let bat = DsuShellClient.batteryInfo(for: pkt.batteryStatus)
+            list.append(ConnectedController(
+                id: "dsu-\(pkt.slot)",
+                name: pkt.snapshot.name,
+                player: list.count + 1,
+                family: .nintendo,
+                batteryPercent: bat.percent,
+                charging: bat.charging
+            ))
+        }
+        onControllersChange(list)
     }
 }
