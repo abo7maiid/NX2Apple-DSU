@@ -8,6 +8,7 @@ Upstream-Status: pending
 Reason: Add Cemuhook UDP (DSU Controller) input and motion support on port 26760
 Issue: LNPANDY/NX2Apple#1
 ---
+ dm/gfx/nvn/nvn_mtl.m       |   4 +-
  dm/host/Makefile           |   2 +-
  dm/host/dsu_proto.h        | 325 +++++++++++++++++++++++++++++++++++++
  dm/host/hle_lifecycle.c    |   2 +
@@ -17,12 +18,35 @@ Issue: LNPANDY/NX2Apple#1
  dm/host/tests/t_dsu.c      | 105 ++++++++++++
  dm/ios/Sources/DmGamepad.m |  92 +++++++++--
  dm/ios/Sources/front_ios.m |   2 +
- 9 files changed, 877 insertions(+), 12 deletions(-)
+ 10 files changed, 880 insertions(+), 13 deletions(-)
  create mode 100644 dm/host/dsu_proto.h
  create mode 100644 dm/host/pad_dsu_apple.h
  create mode 100644 dm/host/pad_dsu_apple.m
  create mode 100644 dm/host/tests/t_dsu.c
 
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index 7212a46..ed898b9 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -15533,15 +15533,17 @@ static void dlss_eval(const p_dlss *c) {
+     const p_dlss a = *c; const int reset = c->reset || e->fresh; e->fresh = 0;
+     // On the real command buffer, the scaler's state set with it: on the encoding thread when it runs (the recording's stand-in has none of MetalFX's calls), where a later
+     // evaluation through the same scaler may already have been recorded
+-    rec_cb_block(g_cb, ^(id<MTL4CommandBuffer> cb) {
++        rec_cb_block(g_cb, ^(id<MTL4CommandBuffer> cb) {
+         sc.colorTexture = col; sc.depthTexture = dep; sc.motionTexture = mot; sc.outputTexture = out; sc.exposureTexture = expo;
+         sc.inputContentWidth = iw; sc.inputContentHeight = ih;
++#if 0   // Disabled for Xcode runner compatibility: MTL4FXTemporalScaler content/output offset properties
+         if (@available(macOS 27.0, iOS 27.0, *)) {   // the rectangles' corners: all at the origin on the game seen, so an older system loses nothing there
+             sc.colorContentOffsetX = (NSUInteger)a.base[DLSS_COLOR][0]; sc.colorContentOffsetY = (NSUInteger)a.base[DLSS_COLOR][1];
+             sc.depthContentOffsetX = (NSUInteger)a.base[DLSS_DEPTH][0]; sc.depthContentOffsetY = (NSUInteger)a.base[DLSS_DEPTH][1];
+             sc.motionContentOffsetX = (NSUInteger)a.base[DLSS_MOTION][0]; sc.motionContentOffsetY = (NSUInteger)a.base[DLSS_MOTION][1];
+             sc.outputOffsetX = (NSUInteger)a.base[DLSS_OUTPUT][0]; sc.outputOffsetY = (NSUInteger)a.base[DLSS_OUTPUT][1];
+         }
++#endif
+         sc.motionVectorScaleX = a.mv[0]; sc.motionVectorScaleY = a.mv[1];
+         sc.jitterOffsetX = a.jitter[0]; sc.jitterOffsetY = a.jitter[1];
+         sc.preExposure = a.pre_exposure;
 diff --git a/dm/host/Makefile b/dm/host/Makefile
 index c059b6b..b3cf152 100644
 --- a/dm/host/Makefile
