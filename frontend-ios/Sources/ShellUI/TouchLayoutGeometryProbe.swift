@@ -64,9 +64,6 @@ final class TouchLayoutGeometryProbeView: UIView {
         isOpaque = false
         isUserInteractionEnabled = false
         accessibilityElementsHidden = true
-        if #available(iOS 27.1, *) {
-            installHingeInteraction()
-        }
     }
 
     required init?(coder: NSCoder) {
@@ -74,7 +71,6 @@ final class TouchLayoutGeometryProbeView: UIView {
     }
 
     override func updateConstraints() {
-        observeReservedRegionChanges()
         super.updateConstraints()
     }
 
@@ -94,50 +90,12 @@ final class TouchLayoutGeometryProbeView: UIView {
         setNeedsLayout()
     }
 
-    @available(iOS 27.1, *)
-    private func installHingeInteraction() {
-        let interaction = UIHingeInteraction { [weak self] _, update in
-            guard let self else { return }
-            self.hingeStatus = Self.status(update.hinge?.status)
-            self.setNeedsUpdateConstraints()
-            self.setNeedsLayout()
-        }
-        addInteraction(interaction)
-        hingeInteraction = interaction
-    }
-
-    @available(iOS 27.1, *)
-    private static func status(_ status: UIHinge.Status?) -> TouchLayoutGeometrySnapshot.HingeStatus? {
-        guard let status else { return nil }
-        return switch status {
-        case .unknown: .unknown
-        case .closed: .closed
-        case .fullyOpen: .fullyOpen
-        case .partiallyOpen: .partiallyOpen
-        @unknown default: .unknown
-        }
-    }
-
-    private func observeReservedRegionChanges() {
-        if #available(iOS 27.1, *) {
-            _ = reservedRegions(kind: .division, options: .includeInactive)
-        }
-    }
-
     private func emitSnapshot() {
         let bounds = CGRect(origin: .zero, size: self.bounds.size)
         guard !bounds.isEmpty else { return }
         let safe = safeAreaInsets
         let insets = PadScreen.Insets(top: safe.top, left: safe.left, bottom: safe.bottom, right: safe.right)
-        let division: CGRect?
-        if #available(iOS 27.1, *) {
-            division = reservedRegions(kind: .division, options: .includeInactive)
-                .lazy.map(\.frame)
-                .compactMap { PadGeo.horizontalDivision(bounds, $0) }
-                .first
-        } else {
-            division = nil
-        }
+        let division: CGRect? = nil
         let snapshot = TouchLayoutGeometrySnapshot(bounds: bounds, safeAreaInsets: insets,
                                                    division: division, hingeStatus: hingeStatus)
         guard snapshot != lastSnapshot else { return }

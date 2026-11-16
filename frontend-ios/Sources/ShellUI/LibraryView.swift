@@ -126,10 +126,7 @@ public struct LibraryView: View {
         NavigationStack {
             Group {
                 #if os(iOS)
-                if #available(iOS 27.1, *) {
-                    content.toolbarMinimizationBehavior(.never, for: .navigationBar)
-                        .toolbarVerticalBehavior(landscapeLibrary ? .disabled : .automatic)
-                } else if #available(iOS 27.0, *) {
+                if #available(iOS 27.0, *) {
                     // Keep library actions available when rotation replaces the vertical scroll view with Cover Flow.
                     content.toolbarMinimizationBehavior(.never, for: .navigationBar)
                 } else { content }
@@ -144,6 +141,31 @@ public struct LibraryView: View {
         .environment(\.shellFocusRefresh, focusRefresh)
         .coordinateSpace(name: "shell")
         .tint(ShellPalette.cream).preferredColorScheme(.dark)
+    }
+
+    private var menuPresentedBinding: Binding<Bool> {
+        Binding(get: { menuPresented }, set: { if !$0 { dismissMenus() } })
+    }
+
+    private var configuredMenuSheet: some View {
+        menuSheet
+            #if os(iOS)
+            .background(TouchEditorPresentation(content: touchLayout.map { AnyView(editorPage($0)) }))
+            #else
+            .sheet(isPresented: Binding(get: { touchLayout != nil }, set: { if !$0 { closeTouchLayout() } })) {
+                if let touchLayout { editorPage(touchLayout) }
+            }
+            #endif
+            .presentationSizing(LauncherMenuSizing(mapping: padMapping != nil))
+            // shortcut: cap tabletop sheets until the runtime keeps large detents clear of the fold.
+            .presentationDetents(horizontalDivision ? [.medium] : [.large])
+            .presentationCompactAdaptation(divisionAxis == nil ? .automatic : .sheet)
+            .presentationDragIndicator(.visible)
+            .presentationBackground(ShellPalette.background)
+            .presentationContentInteraction(touchLayout != nil ? .scrolls : .automatic)
+            .interactiveDismissDisabled(touchLayout != nil)
+            .modifier(MenuPlacement(divided: divisionAxis == .vertical, secondary: controllersOpen || shellSettingsOpen))
+            .modifier(ShellKeyboardNavigation(active: touchLayout == nil && padMapping?.row == nil) { handle($0, from: .keyboard) })
     }
 
     var content: some View {
@@ -172,37 +194,13 @@ public struct LibraryView: View {
 
             }
             .coordinateSpace(name: "shell")
-            .sheet(isPresented: Binding(get: { menuPresented }, set: { if !$0 { dismissMenus() } }), onDismiss: runPendingMenuAction) {
-                menuSheet
-                    #if os(iOS)
-                    .background(TouchEditorPresentation(content: touchLayout.map { AnyView(editorPage($0)) }))
-                    #else
-                    .sheet(isPresented: Binding(get: { touchLayout != nil }, set: { if !$0 { closeTouchLayout() } })) {
-                        if let touchLayout { editorPage(touchLayout) }
-                    }
-                    #endif
-                    .presentationSizing(LauncherMenuSizing(mapping: padMapping != nil))
-                    // shortcut: cap tabletop sheets until the runtime keeps large detents clear of the fold.
-                    .presentationDetents(horizontalDivision ? [.medium] : [.large])
-                    .presentationCompactAdaptation(divisionAxis == nil ? .automatic : .sheet)
-                    .presentationDragIndicator(.visible)
-                    .presentationBackground(ShellPalette.background)
-                    .presentationContentInteraction(touchLayout != nil ? .scrolls : .automatic)
-                    .interactiveDismissDisabled(touchLayout != nil)
-                    .modifier(MenuPlacement(divided: divisionAxis == .vertical, secondary: controllersOpen || shellSettingsOpen))
-                    .modifier(ShellKeyboardNavigation(active: touchLayout == nil && padMapping?.row == nil) { handle($0, from: .keyboard) })
+            .sheet(isPresented: menuPresentedBinding, onDismiss: runPendingMenuAction) {
+                configuredMenuSheet
             }
-
             .environment(\.shellOpenTouchLayout, { openTouchLayout(whole, insets) })
             .onPreferenceChange(FocusTargets.self) { all in
                 targets.libraryValues = all.filter { $0.frame.width > 1 }
             }
-            .onGeometryChange(for: Axis?.self) { geometry in
-                if #available(iOS 27.1, macOS 27.1, *) {
-                    return ShellLayout.divisionAxis(geometry.reservedRegions(kind: .division).first?.frame, in: geometry.size)
-                }
-                return nil
-            } action: { divisionAxis = $0 }
             .onAppear { self.layout = layout }
             .onChange(of: layout) { _, new in self.layout = new }
         }
@@ -524,13 +522,7 @@ public struct LibraryView: View {
     }
 
     @ToolbarContentBuilder var libraryToolbar: some ToolbarContent {
-        #if os(iOS)
-        if #available(iOS 27.1, *) {
-            libraryToolbarItems.axisBehavior(layout.isCoverFlow || layout == .column ? .horizontalOnly : .automatic)
-        } else { libraryToolbarItems }
-        #else
         libraryToolbarItems
-        #endif
     }
 
     var libraryTitlePlacement: ToolbarItemPlacement {

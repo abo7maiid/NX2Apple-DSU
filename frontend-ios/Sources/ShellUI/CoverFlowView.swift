@@ -41,13 +41,6 @@ struct CoverFlowView: View, Equatable {
     var body: some View {
         GeometryReader { geometry in
             flow(size: geometry.size)
-                .onGeometryChange(for: CGRect?.self) { proxy in
-                    if #available(iOS 27.1, macOS 27.1, *) {
-                        let region = proxy.reservedRegions(kind: .division).first?.frame
-                        return ShellLayout.divisionAxis(region, in: proxy.size) == .vertical ? region : nil
-                    }
-                    return nil
-                } action: { division = $0 }
         }
         .ignoresSafeArea(.container)
         .sensoryFeedback(.selection, trigger: selected.id)

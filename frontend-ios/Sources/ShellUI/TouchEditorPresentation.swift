@@ -49,9 +49,6 @@ struct TouchEditorPresentation: UIViewControllerRepresentable {
                 }
                 editor.modalPresentationStyle = .fullScreen
                 editor.isModalInPresentation = true
-                if #available(iOS 27.1, *) {
-                    editor.hasInnerDisplay = !(view.window?.reservedRegions(kind: .division, options: .includeInactive).isEmpty ?? true)
-                }
                 self.editor = editor
                 transitioning = true
                 present(editor, animated: true) { [weak self] in
@@ -85,20 +82,6 @@ struct TouchEditorPresentation: UIViewControllerRepresentable {
 
         override func viewDidLoad() {
             super.viewDidLoad()
-            if #available(iOS 27.1, *) {
-                let interaction = UIHingeInteraction { [weak self] _, update in
-                    guard let self else { return }
-                    let inner = update.hinge.map { $0.status != .closed && $0.status != .unknown } ?? false
-                    guard inner != self.hasInnerDisplay else { return }
-                    self.hasInnerDisplay = inner
-                    self.setNeedsUpdateOfSupportedInterfaceOrientations()
-                    if !inner, self.traitCollection.userInterfaceIdiom == .phone {
-                        self.view.window?.windowScene?.requestGeometryUpdate(.iOS(interfaceOrientations: .landscape))
-                    }
-                }
-                view.addInteraction(interaction)
-                hingeInteraction = interaction
-            }
         }
 
         override var supportedInterfaceOrientations: UIInterfaceOrientationMask {

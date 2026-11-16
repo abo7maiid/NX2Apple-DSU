@@ -27,12 +27,6 @@ struct GameLaunchActions: View {
         .font(.headline)
         .padding(divisionInsets)
         .frame(maxWidth: .infinity, alignment: alignment)
-        .onGeometryChange(for: EdgeInsets.self) { geometry in
-            if #available(iOS 27.1, macOS 27.1, *) {
-                return Self.insets(size: geometry.size, division: geometry.reservedRegions(kind: .division).first?.frame)
-            }
-            return EdgeInsets()
-        } action: { divisionInsets = $0 }
     }
     private func buttons(in namespace: Namespace.ID) -> some View {
         let joining = game.state.isJoining

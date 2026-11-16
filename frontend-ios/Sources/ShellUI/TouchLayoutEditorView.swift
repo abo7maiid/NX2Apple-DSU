@@ -179,9 +179,6 @@ struct TouchLayoutEditorView: View {
     }
 
     private func reservedDivision(in proxy: GeometryProxy) -> CGRect? {
-        #if os(iOS)
-        if #available(iOS 27.1, *) { return proxy.reservedRegions(kind: .division).first?.frame }
-        #endif
         return nil
     }
 

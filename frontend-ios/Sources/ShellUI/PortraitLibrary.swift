@@ -89,19 +89,7 @@ struct PortraitLibrary: View, Equatable {
         GlassEffectContainer(spacing: 12) {
             ScrollViewReader { proxy in
                 Group {
-                    if #available(iOS 27.1, macOS 27.1, *), tabletop {
-                        ArrangementView {
-                            VStack(spacing: 0) {
-                                tabletopHero
-                                gridHeading
-                            }
-                        } secondary: {
-                            gameScroll(includesHero: false)
-                                .safeAreaBar(edge: .bottom, spacing: 0) { bottomBar }
-                        }
-                        .arrangementViewStyle(.split.axes(.vertical))
-                        .background(Color.black)
-                    } else if expanded {
+                    if expanded {
                         // Resize the scroll viewport with the hero so newly exposed tiles also receive touches.
                         VStack(spacing: 0) {
                             expandedHero
@@ -117,14 +105,6 @@ struct PortraitLibrary: View, Equatable {
                     }
                 }
                 .ignoresSafeArea(edges: tabletop ? [.bottom] : wide ? [.top, .bottom] : [.top, .leading, .trailing])
-                .onGeometryChange(for: Bool.self) { geometry in
-                    if #available(iOS 27.1, macOS 27.1, *) {
-                        return ShellLayout.divisionAxis(geometry.reservedRegions(kind: .division).first?.frame, in: geometry.size) == .horizontal
-                    }
-                    return false
-                } action: { newValue in
-                    withAnimation(reduceMotion ? nil : .smooth(duration: 0.35)) { tabletop = newValue }
-                }
                 .overlay(alignment: .topTrailing) {
                     if !nativeBars {
                         HStack(spacing: 10) {
