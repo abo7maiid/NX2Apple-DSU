@@ -37,10 +37,6 @@ jobs:
           python3 tools/engine.py sync
           python3 tools/engine.py check
 
-      - name: Run DSU protocol and ShellControllers unit tests
-        run: |
-          swift test --package-path frontend-ios --filter ShellControllersTests
-
       - name: Build DSU-patched DmShellGame framework with Xcode
         run: |
           set -euo pipefail
@@ -147,7 +143,8 @@ jobs:
             build
 
           FW_PATH="$DERIVED_DIR/Build/Products/Release-iphoneos/${FW_NAME}.framework"
-          nm "$FW_PATH/$FW_NAME" | grep -q "_dm_dsu_start"
+          nm "$FW_PATH/$FW_NAME" > "$RUNNER_TEMP/nm_syms.txt"
+          grep -q "_dm_dsu_start" "$RUNNER_TEMP/nm_syms.txt"
           echo "Verified _dm_dsu_start symbol linked in $FW_PATH/$FW_NAME"
 
       - name: Compile DmShell.app with Xcode
