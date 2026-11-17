@@ -147,6 +147,29 @@ jobs:
           grep -q "_dm_dsu_start" "$RUNNER_TEMP/nm_syms.txt"
           echo "Verified _dm_dsu_start symbol linked in $FW_PATH/$FW_NAME"
 
+      - name: Remove asset catalogs from the DmShell project (bypass actool crash)
+        run: |
+          set -euo pipefail
+          # actool crashes on headless runners ("attempt to insert nil object from objects[0]") while compiling the
+          # shell's Assets.xcassets / AppIcon.icon. Strip them from the runner's copy of the template build_shell.sh
+          # reads, so CompileAssetCatalog never runs. Only this CI checkout is changed; engine/ is untouched.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("frontend-ios/Shell/project-shell.yml")
+          out = []
+          for line in p.read_text(encoding="utf-8").splitlines():
+              s = line.strip()
+              if s.startswith("- path: Gen/Assets.xcassets") or "AppIcon.icon" in s or s.startswith("ASSETCATALOG_COMPILER_APPICON_NAME"):
+                  print("removed from project-shell.yml:", s)
+                  continue
+              out.append(line)
+          p.write_text("\n".join(out) + "\n", encoding="utf-8")
+          PY
+          if grep -nE 'xcassets|AppIcon' frontend-ios/Shell/project-shell.yml; then
+            echo "asset catalog still referenced in project-shell.yml" >&2
+            exit 1
+          fi
+
       - name: Compile DmShell.app with Xcode
         run: |
           set -euo pipefail
@@ -155,20 +178,33 @@ jobs:
           export SHELL_DIR="$RUNNER_TEMP/dmshell_out"
           export DM_SHELL_FRAMEWORKS="$FW_PATH"
           export DM_BUNDLE_ID="org.nxnative.shell"
-          export DM_DISPLAY_NAME="NX2Apple"
+          export DM_SHELL_NAME="NX2Apple"
           export DM_APP_VERSION="1.0"
           export DM_TEAM_ID=""
 
-          bash frontend-ios/Shell/build_shell.sh --build
+          if ! bash frontend-ios/Shell/build_shell.sh --build; then
+            echo "::group::Last 50 lines of $SHELL_DIR/build.log"
+            tail -n 50 "$SHELL_DIR/build.log" 2>/dev/null || echo "(no build.log was written)"
+            echo "::endgroup::"
+            exit 1
+          fi
 
-          test -d "$SHELL_DIR/DmShell.app"
-          test -f "$SHELL_DIR/DmShell.app/DmShell"
-          file "$SHELL_DIR/DmShell.app/DmShell"
+          # build_shell.sh writes the app into its derived data (SHELL_DIR/dd unless DM_XCODE_DERIVED_DATA is set)
+          APP="$SHELL_DIR/dd/Build/Products/Release-iphoneos/DmShell.app"
+          test -d "$APP"
+          test -f "$APP/DmShell"
+          file "$APP/DmShell"
+
+          # Zip with ditto so the executable bits and the frameworks' symlinks survive the artifact upload
+          ARTIFACT_DIR="$RUNNER_TEMP/dmshell_artifact"
+          rm -rf "$ARTIFACT_DIR"
+          mkdir -p "$ARTIFACT_DIR"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ARTIFACT_DIR/DmShell.app.zip"
+          ls -lh "$ARTIFACT_DIR"
 
       - name: Upload DmShell.app artifact
         uses: actions/upload-artifact@v4
         with:
           name: DmShell.app
-          path: ${{ runner.temp }}/dmshell_out/DmShell.app
-          include-hidden-files: true
+          path: ${{ runner.temp }}/dmshell_artifact/DmShell.app.zip
           if-no-files-found: error
