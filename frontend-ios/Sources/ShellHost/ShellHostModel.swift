@@ -89,6 +89,10 @@ public struct ShellHostConfig: Sendable {
 
     public private(set) var globalPadMap = PadMap()
     public private(set) var padMerge = false
+    public private(set) var dsuEnabled = true
+    public private(set) var dsuPlayer1IP = ""
+    public private(set) var dsuPlayer2IP = ""
+    public private(set) var dsuPort = 26760
     /// The last controller state, sent only while the button test is open.
     public private(set) var padSnapshot: PadSnapshot?
 
@@ -144,6 +148,10 @@ public struct ShellHostConfig: Sendable {
         shellChoices = Self.choices(of: shellSettings)
         globalPadMap = shellSettings.padMap
         padMerge = shellSettings.padMerge
+        dsuEnabled = shellSettings.dsuEnabled
+        dsuPlayer1IP = shellSettings.dsuPlayer1IP
+        dsuPlayer2IP = shellSettings.dsuPlayer2IP
+        dsuPort = shellSettings.dsuPort
         // Off the main actor, it lists folders and may write GB: a file the Mac launcher sent in parts is joined first (#899), then
         // the game files are kept out of the iCloud backup (#618), also what an earlier version put there. A joined file can make a
         // game playable, so the library is read again.
@@ -206,6 +214,10 @@ public struct ShellHostConfig: Sendable {
     public func refreshAll() {
         globalPadMap = shellSettings.padMap
         padMerge = shellSettings.padMerge
+        dsuEnabled = shellSettings.dsuEnabled
+        dsuPlayer1IP = shellSettings.dsuPlayer1IP
+        dsuPlayer2IP = shellSettings.dsuPlayer2IP
+        dsuPort = shellSettings.dsuPort
         shellChoices = Self.choices(of: shellSettings)
         startShellScan()
         details = entries.map(detail(for:))
@@ -213,6 +225,16 @@ public struct ShellHostConfig: Sendable {
 
     public func setPadMerge(_ on: Bool) {
         shellSettings.storePadMerge(on)
+        refreshAll()
+    }
+
+    public func setDsuConfig(enabled: Bool, player1IP: String, player2IP: String, port: Int) {
+        shellSettings.storeDsuConfig(enabled: enabled, player1IP: player1IP, player2IP: player2IP, port: port)
+        dsuEnabled = shellSettings.dsuEnabled
+        dsuPlayer1IP = shellSettings.dsuPlayer1IP
+        dsuPlayer2IP = shellSettings.dsuPlayer2IP
+        dsuPort = shellSettings.dsuPort
+        adapter.configureDsu(enabled: dsuEnabled, player1IP: dsuPlayer1IP, player2IP: dsuPlayer2IP, port: dsuPort)
         refreshAll()
     }
 
@@ -683,6 +705,7 @@ public struct ShellHostConfig: Sendable {
             onGlobalPadMapReset: { [weak self] in self?.shellSettings.resetPadMap(); self?.refreshAll() },
             onButtonTest: { [weak self] open in self?.buttonTest(open) },
             onPadMergeChange: { [weak self] on in self?.setPadMerge(on) },
+            onDsuConfigChange: { [weak self] enabled, p1, p2, port in self?.setDsuConfig(enabled: enabled, player1IP: p1, player2IP: p2, port: port) },
             onRestoreSaveBackup: { [weak self] id in self?.restoreLatestSaveBackup(id) },
             onDeleteGame: { [weak self] id, saves in self?.deleteGame(id, saves: saves) },
             onOpenHomeButtonSettings: { [weak self] in self?.openHomeButtonSettings() })

@@ -17,7 +17,8 @@ public struct ShellHostView: View {
     public var body: some View {
         LibraryView(games: model.details, controllers: model.controllers, actions: model.actions, input: model.input,
                     initialSelection: initialSelection, initialDetailOpen: initialDetailOpen, globalPadMap: model.globalPadMap,
-                    padMerge: model.padMerge, padSnapshot: model.padSnapshot,
+                    padMerge: model.padMerge, dsuEnabled: model.dsuEnabled, dsuPlayer1IP: model.dsuPlayer1IP,
+                    dsuPlayer2IP: model.dsuPlayer2IP, dsuPort: model.dsuPort, padSnapshot: model.padSnapshot,
                     signingWarning: model.signingWarning,
                     onDismissSigningWarning: { model.dismissSigningWarning() },
                     canOpenHomeButtonSettings: model.canOpenHomeButtonSettings)

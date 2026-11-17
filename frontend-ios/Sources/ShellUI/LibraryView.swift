@@ -37,6 +37,10 @@ public struct LibraryView: View {
     public let controllers: [ControllerInfo]
     public let globalPadMap: PadMap
     public let padMerge: Bool
+    public let dsuEnabled: Bool
+    public let dsuPlayer1IP: String
+    public let dsuPlayer2IP: String
+    public let dsuPort: Int
     /// The controller's state while the button test is open, from the host.
     public let padSnapshot: PadSnapshot?
     public let signingWarning: SigningWarning?
@@ -93,7 +97,9 @@ public struct LibraryView: View {
     public init(games: [GameDetail], controllers: [ControllerInfo] = [], actions: ShellActions = ShellActions(),
                 input: ShellInputLog = ShellInputLog(), initialSelection: String? = nil, initialDetailOpen: Bool = false,
                 initialControllersOpen: Bool = false, initialShellSettingsOpen: Bool = false, initialFocusVisible: Bool = false,
-                globalPadMap: PadMap = PadMap(), padMerge: Bool = false, padSnapshot: PadSnapshot? = nil,
+                globalPadMap: PadMap = PadMap(), padMerge: Bool = false,
+                dsuEnabled: Bool = true, dsuPlayer1IP: String = "", dsuPlayer2IP: String = "", dsuPort: Int = 26760,
+                padSnapshot: PadSnapshot? = nil,
                 signingWarning: SigningWarning? = nil, onDismissSigningWarning: @escaping () -> Void = {},
                 initialPadMapping: String? = nil, initialButtonTestOpen: Bool = false,
                 canOpenHomeButtonSettings: Bool = false) {
@@ -102,6 +108,10 @@ public struct LibraryView: View {
         self.controllers = controllers
         self.globalPadMap = globalPadMap
         self.padMerge = padMerge
+        self.dsuEnabled = dsuEnabled
+        self.dsuPlayer1IP = dsuPlayer1IP
+        self.dsuPlayer2IP = dsuPlayer2IP
+        self.dsuPort = dsuPort
         self.padSnapshot = padSnapshot
         self.signingWarning = signingWarning
         self.canOpenHomeButtonSettings = canOpenHomeButtonSettings
@@ -362,6 +372,8 @@ public struct LibraryView: View {
                 if retention.draws(.controllers, open: controllersOpen) {
                     ControllersView(controllers: controllers, onBack: back, padMap: globalPadMap,
                                     padMerge: padMerge, onPadMergeChange: menuActions.onPadMergeChange,
+                                    dsuEnabled: dsuEnabled, dsuPlayer1IP: dsuPlayer1IP, dsuPlayer2IP: dsuPlayer2IP, dsuPort: dsuPort,
+                                    onDsuConfigChange: menuActions.onDsuConfigChange,
                                     canOpenHomeButtonSettings: canOpenHomeButtonSettings,
                                     onOpenHomeButtonSettings: menuActions.onOpenHomeButtonSettings)
                         .background(ShellPalette.background)

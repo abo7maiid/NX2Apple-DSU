@@ -294,6 +294,8 @@ public struct ShellActions {
     public var onButtonTest: (Bool) -> Void
     /// Toggles `DM_PAD_MERGE` so every connected controller and touch controls drive player 1 together.
     public var onPadMergeChange: (Bool) -> Void
+    /// Updates Cemuhook UDP (DSU) client settings and restarts the live UDP listener/subscriber.
+    public var onDsuConfigChange: (_ enabled: Bool, _ player1IP: String, _ player2IP: String, _ port: Int) -> Void
     /// Restores the newest backup in `<appFolder>/save-backups/` for `gameID` after backing up the current local save.
     public var onRestoreSaveBackup: (String) -> Void
     /// Deletes the game's data on this device and takes it off the list. `saves`: its saves go too.
@@ -312,6 +314,7 @@ public struct ShellActions {
                 onGlobalPadMapChange: @escaping (String, String) -> Void = { _, _ in },
                 onGlobalPadMapReset: @escaping () -> Void = {}, onButtonTest: @escaping (Bool) -> Void = { _ in },
                 onPadMergeChange: @escaping (Bool) -> Void = { _ in },
+                onDsuConfigChange: @escaping (_ enabled: Bool, _ player1IP: String, _ player2IP: String, _ port: Int) -> Void = { _, _, _, _ in },
                 onRestoreSaveBackup: @escaping (String) -> Void = { _ in },
                 onDeleteGame: @escaping (String, Bool) -> Void = { _, _ in },
                 onOpenHomeButtonSettings: @escaping () -> Void = {}) {
@@ -335,6 +338,7 @@ public struct ShellActions {
         self.onGlobalPadMapReset = onGlobalPadMapReset
         self.onButtonTest = onButtonTest
         self.onPadMergeChange = onPadMergeChange
+        self.onDsuConfigChange = onDsuConfigChange
         self.onRestoreSaveBackup = onRestoreSaveBackup
         self.onDeleteGame = onDeleteGame
         self.onOpenHomeButtonSettings = onOpenHomeButtonSettings

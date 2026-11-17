@@ -10,6 +10,16 @@ public struct ControllersView: View {
     public var padMap: PadMap
     public var padMerge: Bool
     public var onPadMergeChange: (Bool) -> Void
+    public var dsuEnabled: Bool
+    public var dsuPlayer1IP: String
+    public var dsuPlayer2IP: String
+    public var dsuPort: Int
+    public var onDsuConfigChange: (_ enabled: Bool, _ player1IP: String, _ player2IP: String, _ port: Int) -> Void
+    @State private var dsuEnabledDraft: Bool
+    @State private var dsuP1Draft: String
+    @State private var dsuP2Draft: String
+    @State private var dsuPortDraft: String
+    @State private var dsuSavedNotice = false
     @Environment(\.shellFocus) private var focus
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     public var controllers: [ControllerInfo]
@@ -18,10 +28,21 @@ public struct ControllersView: View {
     public var onOpenHomeButtonSettings: () -> Void
     public init(controllers: [ControllerInfo], onBack: @escaping () -> Void = {}, padMap: PadMap = PadMap(),
                 padMerge: Bool = false, onPadMergeChange: @escaping (Bool) -> Void = { _ in },
+                dsuEnabled: Bool = true, dsuPlayer1IP: String = "", dsuPlayer2IP: String = "", dsuPort: Int = 26760,
+                onDsuConfigChange: @escaping (_ enabled: Bool, _ player1IP: String, _ player2IP: String, _ port: Int) -> Void = { _, _, _, _ in },
                 canOpenHomeButtonSettings: Bool = false, onOpenHomeButtonSettings: @escaping () -> Void = {}) {
         self.padMap = padMap
         self.padMerge = padMerge
         self.onPadMergeChange = onPadMergeChange
+        self.dsuEnabled = dsuEnabled
+        self.dsuPlayer1IP = dsuPlayer1IP
+        self.dsuPlayer2IP = dsuPlayer2IP
+        self.dsuPort = dsuPort
+        self.onDsuConfigChange = onDsuConfigChange
+        _dsuEnabledDraft = State(initialValue: dsuEnabled)
+        _dsuP1Draft = State(initialValue: dsuPlayer1IP)
+        _dsuP2Draft = State(initialValue: dsuPlayer2IP)
+        _dsuPortDraft = State(initialValue: String(dsuPort))
         self.controllers = controllers
         self.onBack = onBack
         self.canOpenHomeButtonSettings = canOpenHomeButtonSettings
@@ -69,6 +90,8 @@ public struct ControllersView: View {
                 } footer: {
                     Text(ShellStrings.text("Lets every connected controller and touch controls drive player 1 together."))
                 }
+
+                dsuSection
 
                 Section {
                     Button { openMapping?(Self.mappingID) } label: {
@@ -172,6 +195,78 @@ public struct ControllersView: View {
             Text(label).shellText(14.5).foregroundStyle(.white.opacity(0.7))
                 .fixedSize(horizontal: false, vertical: true)
         }.accessibilityElement(children: .combine)
+    }
+
+    private var dsuSection: some View {
+        Section {
+            Toggle(isOn: $dsuEnabledDraft) {
+                Label(ShellStrings.text("Enable DSU UDP Client"), systemImage: "antenna.radiowaves.left.and.right")
+                    .labelStyle(SettingsRowLabelStyle())
+            }
+            .toggleStyle(NativeCreamToggleStyle())
+            .accessibilityIdentifier("controllers.dsuEnabled")
+
+            if dsuEnabledDraft {
+                LabeledContent(ShellStrings.text("Player 1 IP")) {
+                    TextField("192.168.x.x (optional)", text: $dsuP1Draft)
+                        .multilineTextAlignment(.trailing)
+                        .autocorrectionDisabled()
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.numbersAndPunctuation)
+                        #endif
+                        .accessibilityIdentifier("controllers.dsuP1")
+                }
+
+                LabeledContent(ShellStrings.text("Player 2 IP")) {
+                    TextField("192.168.x.x (optional)", text: $dsuP2Draft)
+                        .multilineTextAlignment(.trailing)
+                        .autocorrectionDisabled()
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.numbersAndPunctuation)
+                        #endif
+                        .accessibilityIdentifier("controllers.dsuP2")
+                }
+
+                LabeledContent(ShellStrings.text("Port")) {
+                    TextField("26760", text: $dsuPortDraft)
+                        .multilineTextAlignment(.trailing)
+                        .autocorrectionDisabled()
+                        #if os(iOS)
+                        .keyboardType(.numberPad)
+                        #endif
+                        .accessibilityIdentifier("controllers.dsuPort")
+                }
+            }
+
+            Button {
+                let port = Int(dsuPortDraft.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 26760
+                let validPort = (1...65535).contains(port) ? port : 26760
+                dsuPortDraft = String(validPort)
+                onDsuConfigChange(dsuEnabledDraft, dsuP1Draft, dsuP2Draft, validPort)
+                dsuSavedNotice = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    dsuSavedNotice = false
+                }
+            } label: {
+                HStack {
+                    Label(ShellStrings.text("Connect / Save"), systemImage: "checkmark.circle.fill")
+                        .labelStyle(SettingsRowLabelStyle())
+                    Spacer()
+                    if dsuSavedNotice {
+                        Text(ShellStrings.text("Saved"))
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(ShellPalette.ready)
+                    }
+                }
+            }
+            .accessibilityIdentifier("controllers.dsuSave")
+        } header: {
+            Text(ShellStrings.text("DSU Controller (Cemuhook UDP)"))
+        } footer: {
+            Text(ShellStrings.text("Enter the IP address of each phone running a Cemuhook DSU server (or leave blank to listen for incoming UDP packets on port 26760)."))
+        }
     }
 }
 

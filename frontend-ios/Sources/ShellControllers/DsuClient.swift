@@ -224,10 +224,10 @@ public final class DsuShellClient: @unchecked Sendable {
     private var socketFd: Int32 = -1
     private var readSource: DispatchSourceRead?
     private var timerSource: DispatchSourceTimer?
-    private var serverAddr = sockaddr_in()
-    private var hasServerAddr = false
+    private var serverAddrs: [sockaddr_in] = []
     private let clientId = UInt32.random(in: 1...UInt32.max)
     private var slots: [Int: SlotPacket] = [:]
+    private var peerKeys: [Int: String] = [:]
     private var lastRxTime: [Int: TimeInterval] = [:]
     private let timeoutSeconds: TimeInterval = 2.5
 
@@ -241,31 +241,48 @@ public final class DsuShellClient: @unchecked Sendable {
         slots.values.filter(\.connected).sorted { $0.slot < $1.slot }
     }
 
+    public func start(enabled: Bool = true, hosts: [String] = [], port: UInt16 = DsuShellClient.defaultPort) {
+        let joined = hosts.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }.joined(separator: ",")
+        if !enabled {
+            stop()
+            return
+        }
+        start(host: joined.isEmpty ? nil : joined, port: port)
+    }
+
     public func start(host: String? = nil, port: UInt16 = DsuShellClient.defaultPort) {
         stop()
         let envSpec = ProcessInfo.processInfo.environment["DM_DSU"]
-        if let envSpec, envSpec == "0" || envSpec.lowercased() == "off" {
+        if host == nil, let envSpec, envSpec == "0" || envSpec.lowercased() == "off" {
             return
         }
-        let targetHost: String
         var targetPort = port
-        var passiveBind = true
         if let envPort = ProcessInfo.processInfo.environment["DM_DSU_PORT"],
            let parsedPort = UInt16(envPort), parsedPort > 0 {
             targetPort = parsedPort
         }
-        if let raw = host ?? envSpec, !raw.isEmpty, raw != "1", raw.lowercased() != "on", raw.lowercased() != "auto" {
-            passiveBind = false
-            if let colon = raw.lastIndex(of: ":"), colon != raw.startIndex {
-                targetHost = String(raw[..<colon])
-                if let p = UInt16(raw[raw.index(after: colon)...]), p > 0 {
-                    targetPort = p
-                }
-            } else {
-                targetHost = raw
-            }
+        let spec = (host ?? envSpec ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        var endpoints: [(host: String, port: UInt16)] = []
+        let passiveBind = true
+        if spec.isEmpty || spec == "1" || spec.lowercased() == "on" || spec.lowercased() == "auto" {
+            endpoints.append(("127.0.0.1", targetPort))
+        } else if spec == "0" || spec.lowercased() == "off" {
+            return
         } else {
-            targetHost = "127.0.0.1"
+            for rawPart in spec.split(separator: ",").prefix(4) {
+                let raw = rawPart.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !raw.isEmpty else { continue }
+                if let colon = raw.lastIndex(of: ":"), colon != raw.startIndex {
+                    let h = String(raw[..<colon])
+                    let p = UInt16(raw[raw.index(after: colon)...]) ?? targetPort
+                    endpoints.append((h, p > 0 ? p : targetPort))
+                } else {
+                    endpoints.append((raw, targetPort))
+                }
+            }
+            if endpoints.isEmpty {
+                endpoints.append(("127.0.0.1", targetPort))
+            }
         }
 
         let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
@@ -299,14 +316,15 @@ public final class DsuShellClient: @unchecked Sendable {
             }
         }
 
-        serverAddr = sockaddr_in()
-        #if canImport(Darwin)
-        serverAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        #endif
-        serverAddr.sin_family = sa_family_t(AF_INET)
-        serverAddr.sin_port = targetPort.bigEndian
-        if inet_pton(AF_INET, targetHost, &serverAddr.sin_addr) == 1 {
-            hasServerAddr = true
+        serverAddrs = endpoints.compactMap { ep in
+            var addr = sockaddr_in()
+            #if canImport(Darwin)
+            addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            #endif
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = ep.port.bigEndian
+            guard inet_pton(AF_INET, ep.host, &addr.sin_addr) == 1 else { return nil }
+            return addr
         }
 
         socketFd = fd
@@ -342,7 +360,8 @@ public final class DsuShellClient: @unchecked Sendable {
             close(socketFd)
         }
         socketFd = -1
-        hasServerAddr = false
+        serverAddrs.removeAll()
+        peerKeys.removeAll()
         if !slots.isEmpty {
             slots.removeAll()
             lastRxTime.removeAll()
@@ -351,17 +370,36 @@ public final class DsuShellClient: @unchecked Sendable {
     }
 
     private func sendSubscription() {
-        guard socketFd >= 0, hasServerAddr else { return }
+        guard socketFd >= 0, !serverAddrs.isEmpty else { return }
         let req = Self.makeDataRequest(clientId: clientId, slot: nil)
-        var dst = serverAddr
-        req.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            withUnsafePointer(to: &dst) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    _ = sendto(socketFd, base, raw.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+        for addr in serverAddrs {
+            var dst = addr
+            req.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                withUnsafePointer(to: &dst) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        _ = sendto(socketFd, base, raw.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                    }
                 }
             }
         }
+    }
+
+    private func resolveLocalSlot(peerIP: UInt32, remoteSlot: Int, connected: Bool) -> Int? {
+        let key = "\(peerIP):\(remoteSlot)"
+        if let existing = peerKeys.first(where: { $0.value == key })?.key {
+            return existing
+        }
+        guard connected else { return nil }
+        if slots[remoteSlot]?.connected != true {
+            peerKeys[remoteSlot] = key
+            return remoteSlot
+        }
+        for i in 0..<4 where slots[i]?.connected != true {
+            peerKeys[i] = key
+            return i
+        }
+        return nil
     }
 
     private func drainSocket() {
@@ -379,23 +417,34 @@ public final class DsuShellClient: @unchecked Sendable {
                 }
             }
             if n <= 0 { break }
-            if !hasServerAddr && from.sin_family == sa_family_t(AF_INET) {
-                serverAddr = from
-                hasServerAddr = true
+            if serverAddrs.isEmpty && from.sin_family == sa_family_t(AF_INET) {
+                serverAddrs.append(from)
             }
-            guard let pkt = Self.parseDataPacket(Data(buf[0..<n])) else { continue }
+            guard var pkt = Self.parseDataPacket(Data(buf[0..<n])) else { continue }
+            let peerIP = from.sin_family == sa_family_t(AF_INET) ? UInt32(from.sin_addr.s_addr) : 0
+            guard let localSlot = resolveLocalSlot(peerIP: peerIP, remoteSlot: pkt.slot, connected: pkt.connected) else { continue }
+            pkt.slot = localSlot
+            pkt.snapshot = PadSnapshot(
+                name: "DSU Controller \(localSlot + 1)",
+                pressed: pkt.snapshot.pressed,
+                leftStick: pkt.snapshot.leftStick,
+                rightStick: pkt.snapshot.rightStick,
+                leftTrigger: pkt.snapshot.leftTrigger,
+                rightTrigger: pkt.snapshot.rightTrigger
+            )
             let now = ProcessInfo.processInfo.systemUptime
-            let wasConnected = slots[pkt.slot]?.connected == true
+            let wasConnected = slots[localSlot]?.connected == true
             if pkt.connected {
-                slots[pkt.slot] = pkt
-                lastRxTime[pkt.slot] = now
+                slots[localSlot] = pkt
+                lastRxTime[localSlot] = now
                 onSlotPacket?(pkt)
                 if !wasConnected {
                     onSlotsChanged?(slots)
                 }
             } else if wasConnected {
-                slots.removeValue(forKey: pkt.slot)
-                lastRxTime.removeValue(forKey: pkt.slot)
+                slots.removeValue(forKey: localSlot)
+                peerKeys.removeValue(forKey: localSlot)
+                lastRxTime.removeValue(forKey: localSlot)
                 onSlotPacket?(pkt)
                 onSlotsChanged?(slots)
             }
@@ -407,6 +456,7 @@ public final class DsuShellClient: @unchecked Sendable {
         var changed = false
         for (slot, ts) in lastRxTime where now - ts > timeoutSeconds {
             lastRxTime.removeValue(forKey: slot)
+            peerKeys.removeValue(forKey: slot)
             if var old = slots.removeValue(forKey: slot) {
                 old.connected = false
                 old.padState = PadState()

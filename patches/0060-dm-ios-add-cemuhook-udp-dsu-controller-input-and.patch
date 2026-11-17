@@ -10,15 +10,15 @@ Issue: LNPANDY/NX2Apple#1
 ---
  dm/gfx/nvn/nvn_mtl.m       |   4 +-
  dm/host/Makefile           |   2 +-
- dm/host/dsu_proto.h        | 325 +++++++++++++++++++++++++++++++++++++
+ dm/host/dsu_proto.h        | 325 ++++++++++++++++++++++++++++++++++
  dm/host/hle_lifecycle.c    |   2 +
- dm/host/pad_dsu_apple.h    |  38 +++++
- dm/host/pad_dsu_apple.m    | 318 ++++++++++++++++++++++++++++++++++++
+ dm/host/pad_dsu_apple.h    |  38 ++++
+ dm/host/pad_dsu_apple.m    | 351 +++++++++++++++++++++++++++++++++++++
  dm/host/tests/Makefile     |   5 +-
- dm/host/tests/t_dsu.c      | 105 ++++++++++++
- dm/ios/Sources/DmGamepad.m |  95 +++++++++--
+ dm/host/tests/t_dsu.c      | 105 +++++++++++
+ dm/ios/Sources/DmGamepad.m |  95 ++++++++--
  dm/ios/Sources/front_ios.m |   2 +
- 10 files changed, 881 insertions(+), 15 deletions(-)
+ 10 files changed, 914 insertions(+), 15 deletions(-)
  create mode 100644 dm/host/dsu_proto.h
  create mode 100644 dm/host/pad_dsu_apple.h
  create mode 100644 dm/host/pad_dsu_apple.m
@@ -457,10 +457,10 @@ index 0000000..8073f25
 +void dm_dsu_quit_buttons(int *home, int *a, int *b);   // Home / A / B state across active DSU slots for the quit prompt
 diff --git a/dm/host/pad_dsu_apple.m b/dm/host/pad_dsu_apple.m
 new file mode 100644
-index 0000000..d14addb
+index 0000000..46fcebd
 --- /dev/null
 +++ b/dm/host/pad_dsu_apple.m
-@@ -0,0 +1,318 @@
+@@ -0,0 +1,351 @@
 +// Cemuhook UDP (DSU Controller, port 26760) client transport for iOS and macOS.
 +// Uses Grand Central Dispatch (dispatch_source_t) on the main queue so all controller callbacks run on the main thread
 +// alongside GameController and Switch 2 BLE callbacks.
@@ -483,11 +483,13 @@ index 0000000..d14addb
 +
 +static dm_dsu_front g_front;
 +static dsu_pad g_pads[DSU_SLOTS];
++static uint32_t g_peer_addr[DSU_SLOTS];
++static uint8_t g_peer_slot[DSU_SLOTS];
 +static int g_sock = -1;
 +static dispatch_source_t g_read_src;
 +static dispatch_source_t g_keepalive_timer;
-+static struct sockaddr_in g_server_addr;
-+static int g_has_server;
++static struct sockaddr_in g_servers[DSU_SLOTS];
++static int g_num_servers;
 +static uint32_t g_client_id;
 +static int g_active = 1, g_verbose, g_map_set;
 +static int8_t g_map[6];
@@ -513,21 +515,28 @@ index 0000000..d14addb
 +static int dsu_blocked(void) { return !g_active || (g_front.blocked && g_front.blocked()); }
 +
 +static void dsu_send_subscribe(void) {
-+    if (g_sock < 0 || !g_has_server) return;
++    if (g_sock < 0 || g_num_servers <= 0) return;
 +    uint8_t req[32];
-+    size_t n = dsu_make_data_req(req, g_client_id, 0, 0);
-+    (void)sendto(g_sock, req, n, 0, (const struct sockaddr *)&g_server_addr, sizeof g_server_addr);
-+    for (uint8_t s = 0; s < DSU_SLOTS; s++) {
-+        n = dsu_make_data_req(req, g_client_id, 1, s);
-+        (void)sendto(g_sock, req, n, 0, (const struct sockaddr *)&g_server_addr, sizeof g_server_addr);
++    for (int srv = 0; srv < g_num_servers; srv++) {
++        size_t n = dsu_make_data_req(req, g_client_id, 0, 0);
++        (void)sendto(g_sock, req, n, 0, (const struct sockaddr *)&g_servers[srv], sizeof g_servers[srv]);
++        for (uint8_t s = 0; s < DSU_SLOTS; s++) {
++            n = dsu_make_data_req(req, g_client_id, 1, s);
++            (void)sendto(g_sock, req, n, 0, (const struct sockaddr *)&g_servers[srv], sizeof g_servers[srv]);
++        }
 +    }
 +}
 +
 +static void dsu_slot_disconnect(dsu_pad *p, const char *reason) {
 +    if (!p->active) return;
++    int idx = (int)(p - g_pads);
 +    int pl = dsu_player(p);
 +    if (pl >= 0) dm_motion_clear_hid(pl);
 +    p->active = 0;
++    if (idx >= 0 && idx < DSU_SLOTS) {
++        g_peer_addr[idx] = 0;
++        g_peer_slot[idx] = 0;
++    }
 +    memset(&p->r, 0, sizeof p->r);
 +    memset(&p->clk, 0, sizeof p->clk);
 +    LOG("[dsu] %s disconnected (%s)", p->name, reason);
@@ -544,16 +553,31 @@ index 0000000..d14addb
 +    }
 +}
 +
++static int dsu_find_or_alloc_slot(uint32_t from_ip, uint8_t dsu_slot, int connected) {
++    for (int i = 0; i < DSU_SLOTS; i++) {
++        if (g_pads[i].active && g_peer_addr[i] == from_ip && g_peer_slot[i] == dsu_slot) return i;
++    }
++    if (!connected) return -1;
++    if (dsu_slot < DSU_SLOTS && !g_pads[dsu_slot].active) return (int)dsu_slot;
++    for (int i = 0; i < DSU_SLOTS; i++) {
++        if (!g_pads[i].active) return i;
++    }
++    return -1;
++}
++
 +static void dsu_handle_packet(const uint8_t *buf, size_t len, const struct sockaddr_in *from) {
 +    dsu_report r;
 +    if (!dsu_report_parse(buf, len, &r)) return;
-+    dsu_pad *p = &g_pads[r.slot];
++    uint32_t from_ip = (from && from->sin_family == AF_INET) ? (uint32_t)from->sin_addr.s_addr : 0;
++    int idx = dsu_find_or_alloc_slot(from_ip, r.slot, r.connected);
++    if (idx < 0) return;
++    dsu_pad *p = &g_pads[idx];
 +    uint64_t now = now_ns();
 +
 +    // Learn the peer address if we started in passive/listen mode and received a packet
-+    if (!g_has_server && from && from->sin_family == AF_INET) {
-+        g_server_addr = *from;
-+        g_has_server = 1;
++    if (g_num_servers == 0 && from && from->sin_family == AF_INET) {
++        g_servers[0] = *from;
++        g_num_servers = 1;
 +    }
 +
 +    if (!r.connected) {
@@ -563,13 +587,17 @@ index 0000000..d14addb
 +
 +    int newly_attached = 0;
 +    if (!p->active) {
-+        p->slot = r.slot;
-+        snprintf(p->name, sizeof p->name, "DSU Controller %u", (unsigned)(r.slot + 1));
++        p->slot = idx;
++        g_peer_addr[idx] = from_ip;
++        g_peer_slot[idx] = r.slot;
++        snprintf(p->name, sizeof p->name, "DSU Controller %d", idx + 1);
 +        p->active = 1;
 +        p->r = r;
 +        p->last_rx_ns = now;
 +        if (g_front.attach && !g_front.attach(p)) {
 +            p->active = 0;
++            g_peer_addr[idx] = 0;
++            g_peer_slot[idx] = 0;
 +            return;
 +        }
 +        newly_attached = 1;
@@ -581,10 +609,10 @@ index 0000000..d14addb
 +    p->r = r;
 +    p->last_rx_ns = now;
 +
-+    if (g_verbose && now - g_last_log_ns[r.slot] >= 1000000000ull) {
-+        g_last_log_ns[r.slot] = now;
-+        LOG("[dsu] slot %u pkt %u: b1=0x%02x b2=0x%02x sticks=(%u,%u %u,%u) acc=(%+.2f,%+.2f,%+.2f) gyro=(%+.1f,%+.1f,%+.1f)",
-+            r.slot, r.packet_num, r.b1, r.b2, r.lx, r.ly, r.rx, r.ry,
++    if (g_verbose && now - g_last_log_ns[idx] >= 1000000000ull) {
++        g_last_log_ns[idx] = now;
++        LOG("[dsu] slot %d (remote %u) pkt %u: b1=0x%02x b2=0x%02x sticks=(%u,%u %u,%u) acc=(%+.2f,%+.2f,%+.2f) gyro=(%+.1f,%+.1f,%+.1f)",
++            idx, r.slot, r.packet_num, r.b1, r.b2, r.lx, r.ly, r.rx, r.ry,
 +            r.raw_motion[0], r.raw_motion[1], r.raw_motion[2],
 +            r.raw_motion[3], r.raw_motion[4], r.raw_motion[5]);
 +    }
@@ -648,8 +676,11 @@ index 0000000..d14addb
 +            if (g_front.detach) g_front.detach(&g_pads[i]);
 +        }
 +        memset(&g_pads[i], 0, sizeof g_pads[i]);
++        g_peer_addr[i] = 0;
++        g_peer_slot[i] = 0;
 +    }
-+    g_has_server = 0;
++    g_num_servers = 0;
++    memset(g_servers, 0, sizeof g_servers);
 +    memset(&g_front, 0, sizeof g_front);
 +}
 +
@@ -664,40 +695,43 @@ index 0000000..d14addb
 +    }
 +}
 +
-+static int parse_dsu_endpoint(const char *spec, const char *port_env, char host_out[128], uint16_t *port_out, int *passive_bind) {
-+    *port_out = DSU_DEFAULT_PORT;
-+    *passive_bind = 0;
-+    host_out[0] = '\0';
-+    if (port_env && atoi(port_env) > 0 && atoi(port_env) <= 65535) {
-+        *port_out = (uint16_t)atoi(port_env);
-+    }
-+    if (spec && (!strcmp(spec, "0") || !strcasecmp(spec, "off"))) return 0;
-+    if (!spec || !*spec || !strcmp(spec, "1") || !strcasecmp(spec, "on") || !strcasecmp(spec, "auto")) {
-+        strlcpy(host_out, "127.0.0.1", 128);
-+        *passive_bind = 1;
-+        return 1;
-+    }
++static int parse_single_endpoint(const char *spec, uint16_t default_port, struct sockaddr_in *out) {
++    char host[128];
++    uint16_t port = default_port;
 +    const char *colon = strrchr(spec, ':');
 +    if (colon && colon != spec) {
 +        size_t hlen = (size_t)(colon - spec);
-+        if (hlen >= 128) hlen = 127;
-+        memcpy(host_out, spec, hlen);
-+        host_out[hlen] = '\0';
++        if (hlen >= sizeof host) hlen = sizeof host - 1;
++        memcpy(host, spec, hlen);
++        host[hlen] = '\0';
 +        int p = atoi(colon + 1);
-+        if (p > 0 && p <= 65535) *port_out = (uint16_t)p;
++        if (p > 0 && p <= 65535) port = (uint16_t)p;
 +    } else {
-+        strlcpy(host_out, spec, 128);
++        strlcpy(host, spec, sizeof host);
 +    }
-+    return 1;
++    memset(out, 0, sizeof *out);
++    out->sin_family = AF_INET;
++    out->sin_port = htons(port);
++    if (inet_pton(AF_INET, host, &out->sin_addr) == 1) return 1;
++    struct addrinfo hints, *res = NULL;
++    memset(&hints, 0, sizeof hints);
++    hints.ai_family = AF_INET;
++    hints.ai_socktype = SOCK_DGRAM;
++    int ok = 0;
++    if (getaddrinfo(host, NULL, &hints, &res) == 0 && res && res->ai_addrlen >= sizeof(struct sockaddr_in)) {
++        out->sin_addr = ((const struct sockaddr_in *)res->ai_addr)->sin_addr;
++        ok = 1;
++    }
++    if (res) freeaddrinfo(res);
++    return ok;
 +}
 +
 +int dm_dsu_start(const dm_dsu_front *front) {
 +    const char *e = getenv("DM_DSU");
 +    const char *pe = getenv("DM_DSU_PORT");
-+    char host[128];
 +    uint16_t port = DSU_DEFAULT_PORT;
-+    int passive_bind = 0;
-+    if (!parse_dsu_endpoint(e, pe, host, &port, &passive_bind)) return 0;
++    if (pe && atoi(pe) > 0 && atoi(pe) <= 65535) port = (uint16_t)atoi(pe);
++    if (e && (!strcmp(e, "0") || !strcasecmp(e, "off"))) return 0;
 +
 +    dm_dsu_teardown();
 +    uint64_t gen = atomic_fetch_add(&g_dsu_gen, 1) + 1;
@@ -710,6 +744,24 @@ index 0000000..d14addb
 +    g_map_set = 0;
 +    if (me && *me && !(g_map_set = dsu_map_parse(me, g_map))) {
 +        LOG("[dsu] DM_DSU_MAP='%s' is not six signed numbers in 1..6: using default map", me);
++    }
++
++    int passive_bind = 1;
++    if (!e || !*e || !strcmp(e, "1") || !strcasecmp(e, "on") || !strcasecmp(e, "auto")) {
++        if (parse_single_endpoint("127.0.0.1", port, &g_servers[0])) g_num_servers = 1;
++    } else {
++        char buf[512];
++        strlcpy(buf, e, sizeof buf);
++        char *cur = buf;
++        while (cur && *cur && g_num_servers < DSU_SLOTS) {
++            char *comma = strchr(cur, ',');
++            if (comma) *comma = '\0';
++            while (*cur == ' ' || *cur == '\t') cur++;
++            size_t len = strlen(cur);
++            while (len > 0 && (cur[len - 1] == ' ' || cur[len - 1] == '\t')) cur[--len] = '\0';
++            if (*cur && parse_single_endpoint(cur, port, &g_servers[g_num_servers])) g_num_servers++;
++            cur = comma ? comma + 1 : NULL;
++        }
 +    }
 +
 +    int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -729,29 +781,10 @@ index 0000000..d14addb
 +    memset(&bind_addr, 0, sizeof bind_addr);
 +    bind_addr.sin_family = AF_INET;
 +    bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-+    // In passive/auto mode (DM_DSU=1), try binding port 26760 directly so a client-pushing DSU app can send straight to us;
-+    // if port 26760 is already bound by a local DSU server on the same host, fall back to an ephemeral port and poll it.
 +    bind_addr.sin_port = htons(passive_bind ? port : 0);
 +    if (bind(fd, (const struct sockaddr *)&bind_addr, sizeof bind_addr) < 0 && passive_bind) {
 +        bind_addr.sin_port = htons(0);
 +        (void)bind(fd, (const struct sockaddr *)&bind_addr, sizeof bind_addr);
-+    }
-+
-+    memset(&g_server_addr, 0, sizeof g_server_addr);
-+    g_server_addr.sin_family = AF_INET;
-+    g_server_addr.sin_port = htons(port);
-+    if (inet_pton(AF_INET, host, &g_server_addr.sin_addr) == 1) {
-+        g_has_server = 1;
-+    } else {
-+        struct addrinfo hints, *res = NULL;
-+        memset(&hints, 0, sizeof hints);
-+        hints.ai_family = AF_INET;
-+        hints.ai_socktype = SOCK_DGRAM;
-+        if (getaddrinfo(host, NULL, &hints, &res) == 0 && res && res->ai_addrlen >= sizeof(struct sockaddr_in)) {
-+            g_server_addr.sin_addr = ((const struct sockaddr_in *)res->ai_addr)->sin_addr;
-+            g_has_server = 1;
-+        }
-+        if (res) freeaddrinfo(res);
 +    }
 +
 +    g_sock = fd;
@@ -776,7 +809,7 @@ index 0000000..d14addb
 +    dispatch_resume(g_keepalive_timer);
 +
 +    dsu_send_subscribe();
-+    LOG("[dsu] Cemuhook UDP client active (target %s:%u, client id 0x%08x)", host, (unsigned)port, g_client_id);
++    LOG("[dsu] Cemuhook UDP client active (port %u, %d target(s), client id 0x%08x)", (unsigned)port, g_num_servers, g_client_id);
 +    return 1;
 +}
 diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile

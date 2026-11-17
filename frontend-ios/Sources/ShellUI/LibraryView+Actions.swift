@@ -32,6 +32,7 @@ extension LibraryView {
         a.onGlobalPadMapChange = { if !echo() { o.onGlobalPadMapChange($0, $1) } }
         a.onGlobalPadMapReset = { if !echo() { o.onGlobalPadMapReset() } }
         a.onPadMergeChange = { if !echo() { o.onPadMergeChange($0) } }
+        a.onDsuConfigChange = { enabled, p1, p2, port in if !echo() { o.onDsuConfigChange(enabled, p1, p2, port) } }
         a.onRestoreSaveBackup = { if !echo() { o.onRestoreSaveBackup($0) } }
         a.onDeleteGame = { if !echo() { o.onDeleteGame($0, $1) } }
         a.onOpenHomeButtonSettings = { if !echo() { o.onOpenHomeButtonSettings() } }

@@ -71,7 +71,8 @@ public struct ConnectedController: Equatable, Sendable {
                 self?.reportFirstSnapshot()
             }
         }
-        dsuClient.start()
+        let store = ShellSettingsStore.current
+        dsuClient.start(enabled: store.dsuEnabled, hosts: [store.dsuPlayer1IP, store.dsuPlayer2IP], port: UInt16(store.dsuPort))
         let center = NotificationCenter.default
         for name in [Notification.Name.GCControllerDidConnect, .GCControllerDidDisconnect] {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
@@ -106,6 +107,13 @@ public struct ConnectedController: Equatable, Sendable {
         stopRepeat()
         batteryTask?.cancel()
         batteryTask = nil
+    }
+
+    public func configureDsu(enabled: Bool, player1IP: String, player2IP: String, port: Int) {
+        let clampedPort = UInt16(clamping: (1...65535).contains(port) ? port : 26760)
+        dsuClient.start(enabled: enabled, hosts: [player1IP, player2IP], port: clampedPort)
+        publish()
+        reportFirstSnapshot()
     }
 
     private nonisolated static func id(of controller: GCController) -> String {

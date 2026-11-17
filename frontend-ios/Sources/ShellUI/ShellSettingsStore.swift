@@ -7,6 +7,10 @@ public final class ShellSettingsStore: @unchecked Sendable {
     public static let padMapKey = "padMap"
     public static let padMergeKey = "padMerge"
     public static let audioMixKey = "audioMix"
+    public static let dsuEnabledKey = "dsuEnabled"
+    public static let dsuPlayer1IPKey = "dsuPlayer1IP"
+    public static let dsuPlayer2IPKey = "dsuPlayer2IP"
+    public static let dsuPortKey = "dsuPort"
     public static let suiteName = "shell-settings"
     public static let dataFolderKey = "globalDataBookmark"
     public static let cloudSavesKey = "globalCloudSavesBookmark"
@@ -122,12 +126,46 @@ public final class ShellSettingsStore: @unchecked Sendable {
         }
     }
 
+    /// Whether the Cemuhook UDP (DSU) client is enabled (on by default).
+    public var dsuEnabled: Bool {
+        (defaults.object(forKey: Self.dsuEnabledKey) as? Bool) ?? true
+    }
+    public var dsuPlayer1IP: String {
+        defaults.string(forKey: Self.dsuPlayer1IPKey) ?? ""
+    }
+    public var dsuPlayer2IP: String {
+        defaults.string(forKey: Self.dsuPlayer2IPKey) ?? ""
+    }
+    public var dsuPort: Int {
+        let p = defaults.integer(forKey: Self.dsuPortKey)
+        return (1...65535).contains(p) ? p : 26760
+    }
+    public func storeDsuConfig(enabled: Bool, player1IP: String, player2IP: String, port: Int) {
+        defaults.set(enabled, forKey: Self.dsuEnabledKey)
+        let p1 = player1IP.trimmingCharacters(in: .whitespacesAndNewlines)
+        let p2 = player2IP.trimmingCharacters(in: .whitespacesAndNewlines)
+        if p1.isEmpty { defaults.removeObject(forKey: Self.dsuPlayer1IPKey) } else { defaults.set(p1, forKey: Self.dsuPlayer1IPKey) }
+        if p2.isEmpty { defaults.removeObject(forKey: Self.dsuPlayer2IPKey) } else { defaults.set(p2, forKey: Self.dsuPlayer2IPKey) }
+        let clampedPort = (1...65535).contains(port) ? port : 26760
+        defaults.set(clampedPort, forKey: Self.dsuPortKey)
+    }
+
+    public var dsuEnvSpec: String {
+        guard dsuEnabled else { return "0" }
+        let ips = [dsuPlayer1IP, dsuPlayer2IP]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return ips.isEmpty ? "1" : ips.joined(separator: ",")
+    }
+
     /// DM_PAD_MAP is deliberately excluded. The host merges it per button at launch.
     /// The shell's value for each `DM_*` switch a game's own settings leave alone.
     public var gameDefaults: [String: String] {
         var values = performanceHUD.map { ["DM_METAL_HUD": $0 ? "1" : "0"] } ?? [:]
         if padMerge { values["DM_PAD_MERGE"] = "1" }
         if audioMix { values["DM_AUDIO_MIX"] = "1" }
+        values["DM_DSU"] = dsuEnvSpec
+        values["DM_DSU_PORT"] = String(dsuPort)
         if touchSize != "medium" { values["DM_TOUCH_SIZE"] = touchSize }
         if touchStick != "corner" { values["DM_TOUCH_STICK"] = touchStick }
         if let mode = defaults.string(forKey: Self.touchModeKey), mode == "2d" || mode == "3d" {
