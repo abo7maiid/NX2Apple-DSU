@@ -10,15 +10,15 @@ Issue: LNPANDY/NX2Apple#1
 ---
  dm/gfx/nvn/nvn_mtl.m       |   4 +-
  dm/host/Makefile           |   2 +-
- dm/host/dsu_proto.h        | 325 ++++++++++++++++++++++++++++++++++
+ dm/host/dsu_proto.h        | 325 ++++++++++++++++++++++++++++++++
  dm/host/hle_lifecycle.c    |   2 +
  dm/host/pad_dsu_apple.h    |  38 ++++
- dm/host/pad_dsu_apple.m    | 351 +++++++++++++++++++++++++++++++++++++
+ dm/host/pad_dsu_apple.m    | 372 +++++++++++++++++++++++++++++++++++++
  dm/host/tests/Makefile     |   5 +-
  dm/host/tests/t_dsu.c      | 105 +++++++++++
  dm/ios/Sources/DmGamepad.m |  95 ++++++++--
  dm/ios/Sources/front_ios.m |   2 +
- 10 files changed, 914 insertions(+), 15 deletions(-)
+ 10 files changed, 935 insertions(+), 15 deletions(-)
  create mode 100644 dm/host/dsu_proto.h
  create mode 100644 dm/host/pad_dsu_apple.h
  create mode 100644 dm/host/pad_dsu_apple.m
@@ -457,10 +457,10 @@ index 0000000..8073f25
 +void dm_dsu_quit_buttons(int *home, int *a, int *b);   // Home / A / B state across active DSU slots for the quit prompt
 diff --git a/dm/host/pad_dsu_apple.m b/dm/host/pad_dsu_apple.m
 new file mode 100644
-index 0000000..46fcebd
+index 0000000..156b15b
 --- /dev/null
 +++ b/dm/host/pad_dsu_apple.m
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,372 @@
 +// Cemuhook UDP (DSU Controller, port 26760) client transport for iOS and macOS.
 +// Uses Grand Central Dispatch (dispatch_source_t) on the main queue so all controller callbacks run on the main thread
 +// alongside GameController and Switch 2 BLE callbacks.
@@ -733,6 +733,26 @@ index 0000000..46fcebd
 +    if (pe && atoi(pe) > 0 && atoi(pe) <= 65535) port = (uint16_t)atoi(pe);
 +    if (e && (!strcmp(e, "0") || !strcasecmp(e, "off"))) return 0;
 +
++    // Fallback/override from the shell's UserDefaults ("shell-settings" suite or standard) when DM_DSU is unset or "1"/"auto"
++    NSString *udSpec = nil;
++    if (!e || !*e || !strcmp(e, "1") || !strcasecmp(e, "on") || !strcasecmp(e, "auto")) {
++        NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:@"shell-settings"] ?: NSUserDefaults.standardUserDefaults;
++        NSNumber *enObj = [ud objectForKey:@"dsuEnabled"];
++        if (enObj && ![enObj boolValue]) return 0;
++        NSInteger udPort = [ud integerForKey:@"dsuPort"];
++        if (udPort > 0 && udPort <= 65535 && (!pe || !*pe)) port = (uint16_t)udPort;
++        NSCharacterSet *ws = NSCharacterSet.whitespaceAndNewlineCharacterSet;
++        NSString *p1 = [[ud stringForKey:@"dsuPlayer1IP"] stringByTrimmingCharactersInSet:ws] ?: @"";
++        NSString *p2 = [[ud stringForKey:@"dsuPlayer2IP"] stringByTrimmingCharactersInSet:ws] ?: @"";
++        NSMutableArray<NSString *> *ips = [NSMutableArray array];
++        if (p1.length) [ips addObject:p1];
++        if (p2.length) [ips addObject:p2];
++        if (ips.count) {
++            udSpec = [ips componentsJoinedByString:@","];
++            e = udSpec.UTF8String;
++        }
++    }
++
 +    dm_dsu_teardown();
 +    uint64_t gen = atomic_fetch_add(&g_dsu_gen, 1) + 1;
 +    g_front = *front;
@@ -750,6 +770,7 @@ index 0000000..46fcebd
 +    if (!e || !*e || !strcmp(e, "1") || !strcasecmp(e, "on") || !strcasecmp(e, "auto")) {
 +        if (parse_single_endpoint("127.0.0.1", port, &g_servers[0])) g_num_servers = 1;
 +    } else {
++        passive_bind = 0;
 +        char buf[512];
 +        strlcpy(buf, e, sizeof buf);
 +        char *cur = buf;

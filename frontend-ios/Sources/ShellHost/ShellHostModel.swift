@@ -1078,8 +1078,10 @@ public struct ShellHostConfig: Sendable {
         refresh(game.titleID)
         do {
             game.shaderResourcesURL = try await ShaderResources.shared.prepare(game)
+            stopControllers()
             try await launcher.launch(game)
         } catch {
+            startControllers()
             notice = error.localizedDescription
         }
     }

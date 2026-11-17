@@ -39,18 +39,25 @@ struct CoverFlowView: View, Equatable {
     }
 
     var body: some View {
-        GeometryReader { geometry in
-            flow(size: geometry.size)
-        }
-        .ignoresSafeArea(.container)
-        .sensoryFeedback(.selection, trigger: selected.id)
-        .onAppear { centredID = selected.id }
-        .onChange(of: selected.id) { _, id in
-
-            // A selection from the D-pad or a tap scrolls the carousel. Never while the player is touching it or it is
-            // still moving: the player's gesture always wins.
-            guard centredID != id, !userScrolling else { return }
-            withAnimation(reduceMotion ? nil : .smooth(duration: 0.2)) { centredID = id }
+        ScrollViewReader { scrollProxy in
+            GeometryReader { geometry in
+                flow(size: geometry.size)
+            }
+            .ignoresSafeArea(.container)
+            .sensoryFeedback(.selection, trigger: selected.id)
+            .onAppear {
+                centredID = selected.id
+                scrollProxy.scrollTo(selected.id, anchor: divided ? .leading : .center)
+            }
+            .onChange(of: selected.id) { _, id in
+                // A selection from the D-pad or a tap scrolls the carousel. Never while the player is touching it or it is
+                // still moving: the player's gesture always wins.
+                guard centredID != id, !userScrolling else { return }
+                withAnimation(reduceMotion ? nil : .smooth(duration: 0.2)) {
+                    centredID = id
+                    scrollProxy.scrollTo(id, anchor: divided ? .leading : .center)
+                }
+            }
         }
     }
 
