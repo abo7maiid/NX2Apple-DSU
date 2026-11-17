@@ -16,9 +16,9 @@ Issue: LNPANDY/NX2Apple#1
  dm/host/pad_dsu_apple.m    | 318 ++++++++++++++++++++++++++++++++++++
  dm/host/tests/Makefile     |   5 +-
  dm/host/tests/t_dsu.c      | 105 ++++++++++++
- dm/ios/Sources/DmGamepad.m |  98 +++++++++--
+ dm/ios/Sources/DmGamepad.m |  95 +++++++++--
  dm/ios/Sources/front_ios.m |   2 +
- 10 files changed, 886 insertions(+), 13 deletions(-)
+ 10 files changed, 881 insertions(+), 15 deletions(-)
  create mode 100644 dm/host/dsu_proto.h
  create mode 100644 dm/host/pad_dsu_apple.h
  create mode 100644 dm/host/pad_dsu_apple.m
@@ -921,7 +921,7 @@ index 0000000..8fda30d
 +    return 0;
 +}
 diff --git a/dm/ios/Sources/DmGamepad.m b/dm/ios/Sources/DmGamepad.m
-index 9860743..4d4e0e4 100644
+index 9860743..7c88986 100644
 --- a/dm/ios/Sources/DmGamepad.m
 +++ b/dm/ios/Sources/DmGamepad.m
 @@ -31,6 +31,7 @@
@@ -932,19 +932,16 @@ index 9860743..4d4e0e4 100644
  #include "pad_slots.h"
  #include "ctrl_prompt.h"
  #include "input_map.h"
-@@ -102,7 +103,11 @@ static void phone_motion_start(UIView *body) {
+@@ -102,7 +103,7 @@ static void phone_motion_start(UIView *body) {
      if (!g_motion.deviceMotionAvailable) { LOG("front end: no device motion, the phone's gyro is not used"); return; }
      LOG("front end: the phone's gyro drives the controller's six-axis sensor %s", mode < 0 ? "while no controller supplies fresh motion" : "always (DM_PHONE_MOTION=1)");
      g_motion.deviceMotionUpdateInterval = 1.0 / 100;
-+#if defined(__IPHONE_27_0)
-     if (@available(iOS 27.0, *)) { g_motion.deviceMotionBody = body; g_motion_body = YES; LOG("front end: the phone's motion comes in the pad view's frame (deviceMotionBody)"); }
-+#else
+-    if (@available(iOS 27.0, *)) { g_motion.deviceMotionBody = body; g_motion_body = YES; LOG("front end: the phone's motion comes in the pad view's frame (deviceMotionBody)"); }
 +    (void)body;
-+#endif
      NSOperationQueue *q = [NSOperationQueue new]; q.maxConcurrentOperationCount = 1;
      [g_motion startDeviceMotionUpdatesToQueue:q withHandler:^(CMDeviceMotion *d, NSError *err) {
          (void)err; if (!d) return;
-@@ -615,12 +620,18 @@ static BOOL g_hintShown;   // once per launch
+@@ -615,12 +616,18 @@ static BOOL g_hintShown;   // once per launch
  // no player until one of its buttons is pressed, then it is the lowest player free (pad_slot_take_lowest), as on the Mac: the players choose their order
  static pad_slots g_slots;
  static GCController *g_held[DM_PLAYERS];   // the controller of each slot, kept alive while it holds it (the slot table keys on its pointer)
@@ -963,7 +960,7 @@ index 9860743..4d4e0e4 100644
  static void read_pad(GCExtendedGamepad *g) {
      front_ios_quit_poll(); if (front_ios_quit_blocks_input()) return;   // the quit prompt has the controllers (Home held 2 s, or Quit in the in-game menu)
      int p = g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)g.controller); if (p < 0 && !g_press_to_join) return;
-@@ -659,6 +670,8 @@ static void pads_start(void) {
+@@ -659,6 +666,8 @@ static void pads_start(void) {
      e = getenv("DM_PAD_PRESS_TO_JOIN"); g_press_to_join = !g_merge && e && atoi(e);
      LOG("front end: %s", g_merge ? "every controller is player 1 (DM_PAD_MERGE)" : "each controller is a player of its own, the touch gamepad plays with player 1");
      if (g_press_to_join) LOG("front end: a controller becomes a player at its first button press, the lowest player free (DM_PAD_PRESS_TO_JOIN)");
@@ -972,7 +969,7 @@ index 9860743..4d4e0e4 100644
  }
  // Called at start and on every connect / disconnect (gone: the controller that was just removed, nil otherwise); returns whether a controller is in use
  static BOOL pads_merged(GCController *gone) {
-@@ -672,8 +685,9 @@ static BOOL pads_merged(GCController *gone) {
+@@ -672,8 +681,9 @@ static BOOL pads_merged(GCController *gone) {
          read_pad(c.extendedGamepad);
      }
      if (!any || !motion) dm_motion_clear(0);   // the phone's gyro (if on) takes over from its next sample
@@ -984,7 +981,7 @@ index 9860743..4d4e0e4 100644
  }
  static BOOL pads_slotted(GCController *gone) {
      NSArray<GCController *> *now = GCController.controllers; char nb[16]; BOOL waiting = NO;
-@@ -703,7 +717,7 @@ static BOOL pads_slotted(GCController *gone) {
+@@ -703,7 +713,7 @@ static BOOL pads_slotted(GCController *gone) {
      }
      dm_pad_players(pad_slot_mask(&g_slots));
      dispatch_async(dispatch_get_main_queue(), ^{ cp_poll(); });   // a controller came or went while the controller applet's prompt is up
@@ -993,7 +990,7 @@ index 9860743..4d4e0e4 100644
  }
  - (void)hidePadHintNow {
      [_padHint.layer removeAllAnimations];
-@@ -866,12 +880,64 @@ static DmCtrlPrompt *g_cp_target;
+@@ -866,12 +876,64 @@ static DmCtrlPrompt *g_cp_target;
  static void cp_buttons(int *a, int *b) {
      *a = *b = 0;
      for (GCController *c in GCController.controllers) { GCExtendedGamepad *g = c.extendedGamepad; if (g) { *a |= g.buttonA.isPressed; *b |= g.buttonB.isPressed; } }
@@ -1059,7 +1056,7 @@ index 9860743..4d4e0e4 100644
  static UILabel *cp_label(const char *text, CGFloat size, UIFontWeight w, CGFloat alpha) {
      UILabel *l = [UILabel new]; l.text = @(text); l.font = [UIFont systemFontOfSize:size weight:w]; l.textColor = [UIColor colorWithWhite:1 alpha:alpha];
      l.numberOfLines = 0; l.textAlignment = NSTextAlignmentCenter; return l;
-@@ -944,7 +1010,7 @@ int front_ctrl_support(int min, int max) {
+@@ -944,7 +1006,7 @@ int front_ctrl_support(int min, int max) {
      dispatch_async(dispatch_get_main_queue(), ^{
          if (!g_view || !front_metal_layer()) { g_cp_ok = 0; dispatch_semaphore_signal(done); return; }
          [g_view reset]; dm_touch_set(NULL, 0);   // nothing the game held stays pressed while the prompt has the input
@@ -1068,7 +1065,7 @@ index 9860743..4d4e0e4 100644
          int a, b; cp_buttons(&a, &b);
          g_cp_done = done; cp_open(&g_cp, min, max, dm_players_reported(), a, b);
          LOG("front end: controller prompt open: %d to %d players wanted, %d in, %d controllers waiting to join", min, max, g_cp.joined, cp_waiting());
-@@ -962,23 +1028,34 @@ int dm_pad_layout(void) { return g_view ? [g_view padLayout] : 0; }
+@@ -962,23 +1024,31 @@ int dm_pad_layout(void) { return g_view ? [g_view padLayout] : 0; }
  bool dm_pad_layout_offered(int layout) { return layout == 0 || layout == 1 || (layout == 2 && dm_opmode() == 0); }
  void dm_pad_layout_set(int layout) { [g_view setPadLayout:layout]; }
  void dm_gamepad_pads_read(void) {   // front_ios.m: the quit prompt closed, the game reads every controller as it is now (a button held through it counts again)
@@ -1102,13 +1099,11 @@ index 9860743..4d4e0e4 100644
      if (g_motion) {
          [g_motion stopAccelerometerUpdates];
          [g_motion stopDeviceMotionUpdates];
-+#if defined(__IPHONE_27_0)
-         if (@available(iOS 27.0, *)) g_motion.deviceMotionBody = nil;
-+#endif
+-        if (@available(iOS 27.0, *)) g_motion.deviceMotionBody = nil;
          g_motion = nil;
      }
      if (g_view) {
-@@ -996,6 +1073,7 @@ void dm_gamepad_teardown(void) {
+@@ -996,6 +1066,7 @@ void dm_gamepad_teardown(void) {
      for (int p = 0; p < DM_PLAYERS; p++) {
          dm_haptics_apple_controller(p, nil);
          g_held[p] = nil;
